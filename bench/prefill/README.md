@@ -58,3 +58,19 @@ El techo medido saltándose la decodificación era 3933, así que queda una part
 - **Control de paridad** (`bench/parity`, modos `dump` y `decode`, FP16) con `IK2_PF_NVFP4=1`, en el camino batch y en el de tandas: pasa en los dos, con top-1 98,5 % y KL media 2,7e-3 en `dump`. Sin el kernel daba 97,8 % y 3,1e-3.
 
 Queda apagado por defecto: es opcional hasta que corra más tiempo en uso real.
+
+### El techo era en parte un artefacto (2026-11-25)
+
+La cota "sin decodificar" (+27 % sobre chunk 4096) se midió con una build que da salida incorrecta, y eso cambia el ruteo. Con `IK2_PROF=1` (sincroniza cada fase, prellenado de 16K, chunk 4096) se ve que esa build usa muchos menos experts distintos: 13 213 aciertos de caché frente a 23 651. Hace menos trabajo que el modelo real, así que no es un techo alcanzable.
+
+| Prellenado 16K, chunk 4096, `IK2_PROF=1` | total | experts (GPU) |
+|---|---:|---:|
+| decode + cuBLAS | 6,10 s | 2,99 s |
+| `IK2_PF_NVFP4=1` | 4,86 s | 2,26 s |
+| sin decodificar (ruteo distinto: no comparable) | 4,55 s | 1,96 s |
+
+En el microbenchmark, cuBLAS sin decodificar (pesos ya en FP16) tarda 8,34 ms por visita y el kernel v2 7,15 ms: **el kernel ya es más rápido que cuBLAS sin ningún costo de decodificación**, a ~90 % del pico de los tensor cores en gate|up. Lo que queda en los experts está fuera del GEMM:
+- las 4 capas Q8_0, que siguen con decode + cuBLAS;
+- la reunión de filas;
+- el SwiGLU, que lee y escribe `gu32` en F32 (~0,3 GB por visita);
+- la suma ponderada en `tmp`.
