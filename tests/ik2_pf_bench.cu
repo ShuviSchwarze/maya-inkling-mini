@@ -111,6 +111,18 @@ int main(int argc, char** argv) {
     const float tb_gu = timed(base_gu), tb_dn = timed(base_dn);
     std::printf("%-26s gate|up %7.3f ms (%5.1f TFLOPS)  down %7.3f ms (%5.1f)  both %7.3f ms\n",
                 "decode + cuBLAS", tb_gu, fl_gu / tb_gu * 1e-9, tb_dn, fl_dn / tb_dn * 1e-9, tb_gu + tb_dn);
+    // the bound: the same cuBLAS GEMMs over weights already in FP16 (one expert's, decoded once, for all of them)
+    k::decode_f16(k::kNVFP4, w_d, (size_t) 2 * F * C, w16_d, 0);
+    const float tc_gu = timed([&] {
+        for (int e = 0; e < E; ++e)
+            if (cnt[e]) gemm16(w16_d, 2 * F, C, x_d + (size_t) start[e] * C, cnt[e], gu_d + (size_t) start[e] * 2 * F);
+    });
+    const float tc_dn = timed([&] {
+        for (int e = 0; e < E; ++e)
+            if (cnt[e]) gemm16(w16_d, C, F, h_d + (size_t) start[e] * F, cnt[e], dn_d + (size_t) start[e] * C);
+    });
+    std::printf("%-26s gate|up %7.3f ms (%5.1f TFLOPS)  down %7.3f ms (%5.1f)  both %7.3f ms\n",
+                "cuBLAS only (no decode)", tc_gu, fl_gu / tc_gu * 1e-9, tc_dn, fl_dn / tc_dn * 1e-9, tc_gu + tc_dn);
 
     k::PfTile* t_d;
     CU(cudaMalloc(&t_d, (size_t) (E + S / 64 + 1) * sizeof(k::PfTile)));
