@@ -5567,6 +5567,120 @@ __global__ void __launch_bounds__(kPfThreads) experts_pf_nvfp4_kernel(const PfTi
         }
 }
 
+
+// v2: the weights' NVFP4 blocks copied raw into shared memory (36 bytes a row a K step: a quarter of FP16) and
+// decoded in registers straight into the B fragments - a 16-bit read gives a lane its b0 (the low nibbles) and b1
+// (the high ones), times the sub-block's scale in FP16 (exact: an E2M1 value times a UE4M3 scale fits FP16, so the
+// same numbers as decode_f16) - with an ST-stage cp.async pipeline for X and the raw weights.  BM rows of one expert
+// x 128 weight rows a block, 8 warps as WMW x (8 / WMW).
+__device__ __forceinline__ uint32_t e2m1x2_lo_bits(uint32_t s) {   // (e2m1_pair_lo's bits: two FP16, no float)
+    const uint32_t sel = (s << 4) & 0x7070u;
+    const uint32_t sgn = ((s & 8u) << 12) | ((s & 0x800u) << 20);
+    return __byte_perm(0x42403c00u, 0x4a484644u, sel) | sgn;
+}
+__device__ __forceinline__ uint32_t e2m1x2_hi_bits(uint32_t s) {
+    const uint32_t sel = s & 0x7070u;
+    const uint32_t sgn = ((s & 0x80u) << 8) | ((s & 0x8000u) << 16);
+    return __byte_perm(0x42403c00u, 0x4a484644u, sel) | sgn;
+}
+__device__ __forceinline__ uint32_t hmul2_bits(uint32_t a, __half2 s) {
+    __half2 x = *reinterpret_cast<__half2*>(&a);
+    x = __hmul2(x, s);
+    return *reinterpret_cast<uint32_t*>(&x);
+}
+constexpr size_t pf2_smem(int bm, int st) { return (size_t) st * ((size_t) bm * kPfLd * 2 + (size_t) kPfBN * 36); }
+
+template <int BM, int WMW, int ST>
+__global__ void __launch_bounds__(kPfThreads) experts_pf2_kernel(const PfTile* __restrict__ tiles, int which,
+                                                                 const uint16_t* __restrict__ X, int K, int N,
+                                                                 float* __restrict__ Y) {
+    constexpr int WNW = 8 / WMW, TM = BM / WMW, TN = kPfBN / WNW, MI = TM / 16, NI = TN / 8;
+    constexpr int XST = BM * kPfLd, WST = kPfBN * 36;   // (a stage: halves of X, bytes of raw weights)
+    extern __shared__ __align__(16) uint8_t pf2_sm[];
+    uint16_t* Xs = (uint16_t*) pf2_sm;
+    uint8_t* Wr = pf2_sm + (size_t) ST * XST * 2;
+    const PfTile tl = tiles[blockIdx.y];
+    const uint8_t* __restrict__ wb = tl.w[which];
+    const int row0 = tl.row0, rows = tl.rows, n0 = blockIdx.x * kPfBN;
+    const int KB = K / kPfBK;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = (warp % WMW) * TM, wn = (warp / WMW) * TN;
+
+    auto load_stage = [&](int kb, int slot) {
+        uint16_t* xs = Xs + (size_t) slot * XST;
+#pragma unroll
+        for (int i = 0; i < BM * 8 / kPfThreads; ++i) {
+            const int ch = tid + i * kPfThreads, r = ch >> 3, c8 = (ch & 7) * 8;
+            const bool ok = r < rows;
+            const uint16_t* src = ok ? X + (size_t) (row0 + r) * K + (size_t) kb * kPfBK + c8 : X;
+            cp_async16(xs + (size_t) r * kPfLd + c8, src, ok);
+        }
+        uint8_t* wr = Wr + (size_t) slot * WST;
+        for (int i = tid; i < kPfBN * 9; i += kPfThreads) {
+            const int r = i / 9, w = i - r * 9;
+            cp_async4(wr + r * 36 + w * 4, wb + ((size_t) (n0 + r) * KB + kb) * 36 + w * 4, true);
+        }
+    };
+
+    float acc[MI][NI][4];
+#pragma unroll
+    for (int a = 0; a < MI; ++a)
+#pragma unroll
+        for (int b = 0; b < NI; ++b)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.0f;
+
+#pragma unroll
+    for (int s = 0; s < ST - 1; ++s) {
+        if (s < KB) load_stage(s, s);
+        cp_async_commit();
+    }
+    const int kp2 = (lane & 3) * 2;
+    for (int kb = 0; kb < KB; ++kb) {
+        cp_async_wait<ST - 2>();
+        __syncthreads();
+        const int nk = kb + ST - 1;
+        if (nk < KB) load_stage(nk, nk % ST);
+        cp_async_commit();
+        const int slot = kb % ST;
+        const uint16_t* xs = Xs + (size_t) slot * XST;
+        const uint8_t* wr = Wr + (size_t) slot * WST;
+        uint32_t scw[NI];
+#pragma unroll
+        for (int ni = 0; ni < NI; ++ni) scw[ni] = *(const uint32_t*) (wr + (wn + ni * 8 + (lane >> 2)) * 36);
+#pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            uint32_t a[MI][4];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+                ldsm_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3],
+                        xs + (size_t) (wm + mi * 16 + (lane & 15)) * kPfLd + sub * 16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int ni = 0; ni < NI; ++ni) {
+                const uint8_t* q = wr + (wn + ni * 8 + (lane >> 2)) * 36 + 4 + sub * 8 + kp2;
+                const uint32_t s16 = *(const uint16_t*) q;
+                const __half hs = __float2half_rn(ue4m3((uint8_t) (scw[ni] >> (8 * sub))));
+                const __half2 sc = __halves2half2(hs, hs);
+                const uint32_t b0 = hmul2_bits(e2m1x2_lo_bits(s16), sc), b1 = hmul2_bits(e2m1x2_hi_bits(s16), sc);
+#pragma unroll
+                for (int mi = 0; mi < MI; ++mi) mma16816(acc[mi][ni], a[mi], b0, b1);
+            }
+        }
+    }
+    cp_async_wait<0>();
+
+#pragma unroll
+    for (int mi = 0; mi < MI; ++mi)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = wm + mi * 16 + (lane >> 2) + h * 8;
+            if (r >= rows) continue;
+            float* yr = Y + (size_t) (row0 + r) * N + n0 + wn + (lane & 3) * 2;
+#pragma unroll
+            for (int ni = 0; ni < NI; ++ni)
+                *(float2*) (yr + ni * 8) = make_float2(acc[mi][ni][2 * h], acc[mi][ni][2 * h + 1]);
+        }
+}
 }  // namespace
 
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
@@ -6821,21 +6935,58 @@ void attn_slots_f16(const uint16_t* q16, const float* r, int r_ld, const float* 
 
 bool experts_pf_nvfp4_fits(int K, int N) { return K % kPfBK == 0 && N % kPfBN == 0 && K >= kPfBK; }
 
+// the kernel experts_pf_nvfp4 runs (IK2_PF_KERNEL, or set by experts_pf_nvfp4_variant): 1 the first one (tiles of
+// IK2_PF_BM rows, 64 or 128), 21 .. 25 v2's shapes - see pf_variant_bm
+static int g_pf_variant = -1;
+static int pf_variant() {
+    if (g_pf_variant < 0) g_pf_variant = getenv("IK2_PF_KERNEL") ? atoi(getenv("IK2_PF_KERNEL")) : 23;
+    return g_pf_variant;
+}
+void experts_pf_nvfp4_variant(int v) { g_pf_variant = v; }
+int experts_pf_nvfp4_bm() {
+    switch (pf_variant()) {
+        case 21: case 22: case 23: case 25: return 128;
+        case 24: return 64;
+        default: return getenv("IK2_PF_BM") && atoi(getenv("IK2_PF_BM")) == 64 ? 64 : 128;
+    }
+}
+template <int BM, int WMW, int ST>
+static void pf2_launch(const PfTile* tiles, int n_tiles, int which, const uint16_t* X, int K, int N, float* Y,
+                       cudaStream_t s) {
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(experts_pf2_kernel<BM, WMW, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int) pf2_smem(BM, ST));
+        attr = true;
+    }
+    experts_pf2_kernel<BM, WMW, ST><<<dim3((unsigned) (N / kPfBN), (unsigned) n_tiles), kPfThreads, pf2_smem(BM, ST),
+                                      s>>>(tiles, which, X, K, N, Y);
+}
 void experts_pf_nvfp4(const PfTile* tiles, int n_tiles, int bm, int which, const uint16_t* X, int K, int N, float* Y,
                       cudaStream_t s) {
     if (n_tiles <= 0) return;
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(experts_pf_nvfp4_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) pf_smem(64));
-        cudaFuncSetAttribute(experts_pf_nvfp4_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int) pf_smem(128));
-        attr = true;
+    switch (pf_variant()) {
+        case 21: pf2_launch<128, 2, 3>(tiles, n_tiles, which, X, K, N, Y, s); break;
+        case 22: pf2_launch<128, 4, 3>(tiles, n_tiles, which, X, K, N, Y, s); break;
+        case 23: pf2_launch<128, 2, 2>(tiles, n_tiles, which, X, K, N, Y, s); break;
+        case 24: pf2_launch<64, 2, 3>(tiles, n_tiles, which, X, K, N, Y, s); break;
+        case 25: pf2_launch<128, 2, 4>(tiles, n_tiles, which, X, K, N, Y, s); break;
+        default: {
+            static bool attr = false;
+            if (!attr) {
+                cudaFuncSetAttribute(experts_pf_nvfp4_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int) pf_smem(64));
+                cudaFuncSetAttribute(experts_pf_nvfp4_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int) pf_smem(128));
+                attr = true;
+            }
+            const dim3 g((unsigned) n_tiles, (unsigned) (N / kPfBN));
+            if (bm == 128)
+                experts_pf_nvfp4_kernel<128><<<g, kPfThreads, pf_smem(128), s>>>(tiles, which, X, K, N, Y);
+            else
+                experts_pf_nvfp4_kernel<64><<<g, kPfThreads, pf_smem(64), s>>>(tiles, which, X, K, N, Y);
+        }
     }
-    const dim3 g((unsigned) n_tiles, (unsigned) (N / kPfBN));
-    if (bm == 128)
-        experts_pf_nvfp4_kernel<128><<<g, kPfThreads, pf_smem(128), s>>>(tiles, which, X, K, N, Y);
-    else
-        experts_pf_nvfp4_kernel<64><<<g, kPfThreads, pf_smem(64), s>>>(tiles, which, X, K, N, Y);
     check("experts_pf_nvfp4");
 }
 

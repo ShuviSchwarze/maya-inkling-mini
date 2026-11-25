@@ -428,6 +428,10 @@ struct PfTile {
     int row0, rows;
 };
 bool experts_pf_nvfp4_fits(int K, int N);
+/// The rows a tile may hold for the kernel experts_pf_nvfp4 runs (64 or 128), and that kernel (IK2_PF_KERNEL: 21 the
+/// default - raw weights decoded in registers, 128 x 128, 2 stages; 1 the first version; tests and benches set it).
+int experts_pf_nvfp4_bm();
+void experts_pf_nvfp4_variant(int v);
 void experts_pf_nvfp4(const PfTile* tiles, int n_tiles, int bm, int which, const uint16_t* X, int K, int N, float* Y,
                       cudaStream_t s);
 /// ... on the host (the reference of the tests, and the embedding's rows).

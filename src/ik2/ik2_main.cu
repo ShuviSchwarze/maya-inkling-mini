@@ -2005,45 +2005,56 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             k::decode_f16(Ly.ty[2], down, (size_t)C * F, X.w16, g_s);
             gemm16(X.w16, C, F, hidden, W.cnt[e], output, C);
         };
+        // IK2_PF_NVFP4=1: an NVFP4 layer's experts as one grouped GEMM each way (k::experts_pf_nvfp4: the weights
+        // decoded in shared memory), instead of each expert decoded to FP16 in VRAM and a cuBLAS GEMM
+        static const bool pf_nvfp4 = getenv("IK2_PF_NVFP4") && atoi(getenv("IK2_PF_NVFP4"));
+        const bool grouped = pf_nvfp4 && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 &&
+                             Ly.ty[2] == k::kNVFP4 && Ly.eb[0] == (size_t) F * C / 64 * 36 &&
+                             k::experts_pf_nvfp4_fits(C, 2 * F) && k::experts_pf_nvfp4_fits(F, C);
+        // the tiles of experts [e0, e1) - at most pf_bm rows each, their rows counted from row r0 - written to the host
+        // array at off (pf_add: how many), then the array's first n sent to the device in one copy (pf_send).  The host
+        // array is a ring of two by the layer's parity: a layer's copy is done before the layer after next writes it
+        static k::PfTile* tiles_h[2] = {nullptr, nullptr};
+        static k::PfTile* tiles_d[2] = {nullptr, nullptr};
+        static int tiles_cap = 0;
+        const int pf_bm = grouped ? k::experts_pf_nvfp4_bm() : 0;
+        if (grouped && c.E + S / 64 + 1 > tiles_cap) {
+            const int need = c.E + S / 64 + 1;
+            CU(cudaDeviceSynchronize());
+            for (int b = 0; b < 2; ++b) {
+                if (tiles_h[b]) {
+                    CU(cudaFreeHost(tiles_h[b]));
+                    CU(cudaFree(tiles_d[b]));
+                }
+                CU(cudaHostAlloc(&tiles_h[b], (size_t) need * sizeof(k::PfTile), cudaHostAllocPortable));
+                CU(cudaMalloc(&tiles_d[b], (size_t) need * sizeof(k::PfTile)));
+            }
+            tiles_cap = need;
+        }
+        auto pf_add = [&](int e0, int e1, int r0, int off) -> int {
+            k::PfTile* th = tiles_h[ps] + off;
+            int n = 0;
+            for (int e = e0; e < e1; ++e)
+                for (int m = 0; m < W.cnt[e]; m += pf_bm)
+                    th[n++] = {{X.slot_ptrs[e], X.slot_ptrs[e] + Ly.eb[0] + Ly.eb[1]}, W.start[e] + m - r0,
+                               std::min(pf_bm, W.cnt[e] - m)};
+            return n;
+        };
+        auto pf_send = [&](int n) -> const k::PfTile* {
+            CU(cudaMemcpyAsync(tiles_d[ps], tiles_h[ps], (size_t) n * sizeof(k::PfTile), cudaMemcpyHostToDevice, g_s));
+            return tiles_d[ps];
+        };
         if (batch) {
             // Attention has finished. Its temporary output is free until the next visit.
             uint16_t* sorted_input = (uint16_t*)X.lg;
             float* sorted_out = (float*)(sorted_input + (size_t)S * std::max(C, F));
             gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, sorted_input);
-            // IK2_PF_NVFP4=1: an NVFP4 layer's experts as one grouped GEMM each way (k::experts_pf_nvfp4: the weights
-            // decoded in shared memory), instead of each expert decoded to FP16 in VRAM and a cuBLAS GEMM
-            static const bool pf_nvfp4 = getenv("IK2_PF_NVFP4") && atoi(getenv("IK2_PF_NVFP4"));
-            const bool grouped = pf_nvfp4 && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 &&
-                                 Ly.ty[2] == k::kNVFP4 && Ly.eb[0] == (size_t) F * C / 64 * 36 &&
-                                 k::experts_pf_nvfp4_fits(C, 2 * F) && k::experts_pf_nvfp4_fits(F, C);
             if (grouped) {
-                static k::PfTile* tiles_h[2] = {nullptr, nullptr};
-                static k::PfTile* tiles_d[2] = {nullptr, nullptr};
-                static int tiles_cap = 0;
-                static const int bm = getenv("IK2_PF_BM") && atoi(getenv("IK2_PF_BM")) == 64 ? 64 : 128;
-                const int need = c.E + S / 64 + 1;
-                if (need > tiles_cap) {
-                    CU(cudaDeviceSynchronize());
-                    for (int b = 0; b < 2; ++b) {
-                        if (tiles_h[b]) {
-                            CU(cudaFreeHost(tiles_h[b]));
-                            CU(cudaFree(tiles_d[b]));
-                        }
-                        CU(cudaHostAlloc(&tiles_h[b], (size_t) need * sizeof(k::PfTile), cudaHostAllocPortable));
-                        CU(cudaMalloc(&tiles_d[b], (size_t) need * sizeof(k::PfTile)));
-                    }
-                    tiles_cap = need;
-                }
-                k::PfTile* th = tiles_h[ps];
-                int nt = 0;
-                for (int e : X.hit_exps)
-                    for (int m = 0; m < W.cnt[e]; m += bm)
-                        th[nt++] = {{X.slot_ptrs[e], X.slot_ptrs[e] + Ly.eb[0] + Ly.eb[1]}, W.start[e] + m,
-                                    std::min(bm, W.cnt[e] - m)};
-                CU(cudaMemcpyAsync(tiles_d[ps], th, (size_t) nt * sizeof(k::PfTile), cudaMemcpyHostToDevice, g_s));
-                k::experts_pf_nvfp4(tiles_d[ps], nt, bm, 0, sorted_input, C, 2 * F, X.gu32, g_s);
+                const int nt = pf_add(0, c.E, 0, 0);
+                const k::PfTile* td = pf_send(nt);
+                k::experts_pf_nvfp4(td, nt, pf_bm, 0, sorted_input, C, 2 * F, X.gu32, g_s);
                 k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
-                k::experts_pf_nvfp4(tiles_d[ps], nt, bm, 1, sorted_input, F, C, sorted_out, g_s);
+                k::experts_pf_nvfp4(td, nt, pf_bm, 1, sorted_input, F, C, sorted_out, g_s);
             } else {
                 for (int e : X.hit_exps) {
                     const size_t offset = W.start[e];
@@ -2060,6 +2071,41 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             return;
         }
         CU(cudaMemsetAsync(X.tmp, 0, (size_t) T * C * 4, g_s));
+        if (grouped && n_miss == 0 && d == -1 && X.pf_layers[l % Work::kPfRing] != l) {
+            // the grouped GEMMs where the whole visit's rows do not fit the batch path's scratch (--chunk 4096): runs of
+            // experts of at most T rows - the per-expert buffers' size - each gathered, both products, then added into
+            // tmp an expert at a time in index order, as run_exp does
+            struct Run {
+                int e0, e1, r0, rows, t0, nt;
+            };
+            std::vector<Run> runs;
+            int nt_all = 0;
+            for (int e0 = 0; e0 < c.E;) {
+                int e1 = e0, rows = 0;
+                while (e1 < c.E && rows + W.cnt[e1] <= T) rows += W.cnt[e1++];
+                if (e1 == e0) ++e1;   // (cannot happen: an expert has at most T rows)
+                if (rows) {
+                    const int n = pf_add(e0, e1, W.start[e0], nt_all);
+                    runs.push_back({e0, e1, W.start[e0], rows, nt_all, n});
+                    nt_all += n;
+                }
+                e0 = e1;
+            }
+            const k::PfTile* td = pf_send(nt_all);
+            for (const Run& r : runs) {
+                gather_f16_16_kernel<<<r.rows, 256, 0, g_s>>>(xin, X.gidx + r.r0, r.rows, C, X.ex16);
+                k::experts_pf_nvfp4(td + r.t0, r.nt, pf_bm, 0, X.ex16, C, 2 * F, X.gu32, g_s);
+                k::swiglu_cap_f32(X.gu32, r.rows, F, X.sg + r.r0, X.su + r.r0, c.gate_cap, c.up_cap, X.h16, g_s);
+                k::experts_pf_nvfp4(td + r.t0, r.nt, pf_bm, 1, X.h16, F, C, X.y32, g_s);
+                for (int e = r.e0; e < r.e1; ++e)
+                    if (W.cnt[e])
+                        scatter_add_rows_kernel<<<W.cnt[e], 256, 0, g_s>>>(X.y32 + (size_t) (W.start[e] - r.r0) * C,
+                                                                           X.gidx + W.start[e], X.wtr + W.start[e],
+                                                                           C, X.tmp, C);
+            }
+            X.pf_layers[l % Work::kPfRing] = -1;
+            return;
+        }
 
         // Each expert: its tokens gathered, gate/up, SwiGLU, down, then added into tmp with their weights. The experts run
         // in index order whatever is cached (each waiting for its copies), so the sums' order and the result do not
