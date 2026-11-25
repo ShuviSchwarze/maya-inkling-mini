@@ -420,6 +420,16 @@ size_t block_bytes(int type);
 /// n values (a multiple of the block's) of `type` blocks -> FP16 (nearest; NVFP4: exact) or F32.
 void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaStream_t s);
 void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStream_t s);
+/// The prompt's NVFP4 experts as one grouped GEMM (tensor cores, the weights decoded in shared memory, F32 sums): for
+/// every tile, Y [row0 + r][N] = X [row0 + r][K] . W [N][K]^T over its rows r < rows (at most bm: 64 or 128), W = w[which] as
+/// NVFP4 rows of K values.  K a multiple of 64 and N of 128 (experts_pf_nvfp4_fits).  tiles on the device.
+struct PfTile {
+    const uint8_t* w[2];
+    int row0, rows;
+};
+bool experts_pf_nvfp4_fits(int K, int N);
+void experts_pf_nvfp4(const PfTile* tiles, int n_tiles, int bm, int which, const uint16_t* X, int K, int N, float* Y,
+                      cudaStream_t s);
 /// ... on the host (the reference of the tests, and the embedding's rows).
 void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 

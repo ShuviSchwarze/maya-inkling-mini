@@ -5438,6 +5438,135 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
     }
 }
 
+
+// ---- the prompt's NVFP4 experts as one grouped GEMM on the tensor cores (run_prefill_moe's batch path)
+// Y [row][N] F32 = X [row][K] FP16 . W_e [N][K]^T, W_e NVFP4 as the GGUF holds it (a row of K values: K / 64 blocks of
+// 36 bytes - 4 UE4M3 scales, then 16 bytes of E2M1 nibbles a 16-value sub-block), for the rows of every expert at
+// once: a block one tile's 64 rows of one expert (PfTile) against 128 of its weight rows.  The weights are decoded to
+// FP16 in shared memory a 64-wide K step at a time (decode_f16_nvfp4_kernel's arithmetic: exact), so they never go
+// to VRAM as FP16; mma.sync m16n8k16, F32 sums.  Double buffered: the next step's X by cp.async and its weight bytes
+// into registers while the tensor cores take this one.
+constexpr int kPfBN = 128, kPfBK = 64, kPfLd = kPfBK + 8;   // (row pad: conflict-free ldmatrix)
+constexpr int kPfThreads = 256;
+constexpr size_t pf_smem(int bm) { return (size_t) 2 * (bm + kPfBN) * kPfLd * 2; }
+
+template <int kPfBM>
+__global__ void __launch_bounds__(kPfThreads) experts_pf_nvfp4_kernel(const PfTile* __restrict__ tiles, int which,
+                                                                      const uint16_t* __restrict__ X, int K, int N,
+                                                                      float* __restrict__ Y) {
+    extern __shared__ __align__(16) uint16_t pf_sm[];
+    uint16_t* Xs = pf_sm;                              // [2][kPfBM][kPfLd]
+    uint16_t* Ws = pf_sm + 2 * kPfBM * kPfLd;          // [2][kPfBN][kPfLd]
+    const PfTile tl = tiles[blockIdx.x];
+    const uint8_t* __restrict__ wb = tl.w[which];
+    const int row0 = tl.row0, rows = tl.rows, n0 = blockIdx.y * kPfBN;
+    const int KB = K / kPfBK;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    constexpr int MI = kPfBM / 32;   // (a warp's m16 tiles: its kPfBM / 2 rows x 32 columns of the kPfBM x 128)
+    const int wm = (warp & 1) * (kPfBM / 2), wn = (warp >> 1) * 32;
+
+    // X: kPfBM rows x 64 values in chunks of 16 bytes, kPfBM / 32 a thread; rows past the tile's zero-filled
+    auto load_x = [&](int kb, int buf) {
+#pragma unroll
+        for (int i = 0; i < kPfBM / 32; ++i) {
+            const int ch = tid + i * kPfThreads, r = ch >> 3, c8 = (ch & 7) * 8;
+            const bool ok = r < rows;
+            const uint16_t* src = ok ? X + (size_t) (row0 + r) * K + (size_t) kb * kPfBK + c8 : X;
+            cp_async16(Xs + (size_t) (buf * kPfBM + r) * kPfLd + c8, src, ok);
+        }
+    };
+    // W: 128 rows x 4 sub-blocks = 512 tasks, 2 a thread: the scale word and the sub-block's 8 nibble bytes
+    uint32_t wsc[2], wq0[2], wq1[2];
+    auto fetch_w = [&](int kb) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int t = tid + i * kPfThreads, r = t >> 2, sub = t & 3;
+            const uint8_t* b = wb + ((size_t) (n0 + r) * KB + kb) * 36;
+            wsc[i] = __ldg((const uint32_t*) b);
+            wq0[i] = __ldg((const uint32_t*) (b + 4 + sub * 8));
+            wq1[i] = __ldg((const uint32_t*) (b + 8 + sub * 8));
+        }
+    };
+    auto store_w = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int t = tid + i * kPfThreads, r = t >> 2, sub = t & 3;
+            const float d = ue4m3((uint8_t) (wsc[i] >> (8 * sub)));
+            const uint32_t q0 = wq0[i], q1 = wq1[i];
+            const float2 w01 = e2m1_pair_lo(q0), w23 = e2m1_pair_lo(q0 >> 16);
+            const float2 w45 = e2m1_pair_lo(q1), w67 = e2m1_pair_lo(q1 >> 16);
+            const float2 w89 = e2m1_pair_hi(q0), wAB = e2m1_pair_hi(q0 >> 16);
+            const float2 wCD = e2m1_pair_hi(q1), wEF = e2m1_pair_hi(q1 >> 16);
+            uint4* o = (uint4*) (Ws + (size_t) (buf * kPfBN + r) * kPfLd + sub * 16);
+            o[0] = make_uint4(f2_to_u32(w01.x * d, w01.y * d), f2_to_u32(w23.x * d, w23.y * d),
+                              f2_to_u32(w45.x * d, w45.y * d), f2_to_u32(w67.x * d, w67.y * d));
+            o[1] = make_uint4(f2_to_u32(w89.x * d, w89.y * d), f2_to_u32(wAB.x * d, wAB.y * d),
+                              f2_to_u32(wCD.x * d, wCD.y * d), f2_to_u32(wEF.x * d, wEF.y * d));
+        }
+    };
+
+    float acc[MI][4][4];
+#pragma unroll
+    for (int a = 0; a < MI; ++a)
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.0f;
+
+    load_x(0, 0);
+    cp_async_commit();
+    fetch_w(0);
+    store_w(0);
+    cp_async_wait<0>();
+    __syncthreads();
+
+    for (int kb = 0; kb < KB; ++kb) {
+        const int cur = kb & 1, nxt = cur ^ 1;
+        const bool more = kb + 1 < KB;
+        if (more) {
+            load_x(kb + 1, nxt);
+            cp_async_commit();
+            fetch_w(kb + 1);
+        }
+        const uint16_t* xs = Xs + (size_t) cur * kPfBM * kPfLd;
+        const uint16_t* ws = Ws + (size_t) cur * kPfBN * kPfLd;
+#pragma unroll
+        for (int k16 = 0; k16 < kPfBK; k16 += 16) {
+            uint32_t a[MI][4], b[4][2];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+                ldsm_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3],
+                        xs + (size_t) (wm + mi * 16 + (lane & 15)) * kPfLd + k16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int nj = 0; nj < 2; ++nj)
+                ldsm_x4(b[2 * nj][0], b[2 * nj][1], b[2 * nj + 1][0], b[2 * nj + 1][1],
+                        ws + (size_t) (wn + nj * 16 + (lane & 7) + ((lane >> 4) << 3)) * kPfLd + k16 +
+                            ((lane >> 3) & 1) * 8);
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < 4; ++ni) mma16816(acc[mi][ni], a[mi], b[ni][0], b[ni][1]);
+        }
+        if (more) {
+            store_w(nxt);
+            cp_async_wait<0>();
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int mi = 0; mi < MI; ++mi)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = wm + mi * 16 + (lane >> 2) + h * 8;
+            if (r >= rows) continue;
+            float* yr = Y + (size_t) (row0 + r) * N + n0 + wn + (lane & 3) * 2;
+#pragma unroll
+            for (int ni = 0; ni < 4; ++ni)
+                *(float2*) (yr + ni * 8) = make_float2(acc[mi][ni][2 * h], acc[mi][ni][2 * h + 1]);
+        }
+}
+
 }  // namespace
 
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
@@ -6687,6 +6816,27 @@ void attn_slots_f16(const uint16_t* q16, const float* r, int r_ld, const float* 
     attn_slots_impl<uint16_t>(q16, r, r_ld, sink, kc_base, vc_base, kv_cap, H, Hkv, pos_d, slot_ids, page_tables,
                               pt_stride, B, n_split, qk_scale, 1.0f, proj, d_rel, extent, window, scratch, out, gate,
                               gate_ld, out16, s);
+}
+
+
+bool experts_pf_nvfp4_fits(int K, int N) { return K % kPfBK == 0 && N % kPfBN == 0 && K >= kPfBK; }
+
+void experts_pf_nvfp4(const PfTile* tiles, int n_tiles, int bm, int which, const uint16_t* X, int K, int N, float* Y,
+                      cudaStream_t s) {
+    if (n_tiles <= 0) return;
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(experts_pf_nvfp4_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) pf_smem(64));
+        cudaFuncSetAttribute(experts_pf_nvfp4_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int) pf_smem(128));
+        attr = true;
+    }
+    const dim3 g((unsigned) n_tiles, (unsigned) (N / kPfBN));
+    if (bm == 128)
+        experts_pf_nvfp4_kernel<128><<<g, kPfThreads, pf_smem(128), s>>>(tiles, which, X, K, N, Y);
+    else
+        experts_pf_nvfp4_kernel<64><<<g, kPfThreads, pf_smem(64), s>>>(tiles, which, X, K, N, Y);
+    check("experts_pf_nvfp4");
 }
 
 }  // namespace ik2::k

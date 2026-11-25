@@ -2010,14 +2010,50 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             uint16_t* sorted_input = (uint16_t*)X.lg;
             float* sorted_out = (float*)(sorted_input + (size_t)S * std::max(C, F));
             gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, sorted_input);
-            for (int e : X.hit_exps) {
-                const size_t offset = W.start[e];
-                gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
-            }
-            k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
-            for (int e : X.hit_exps) {
-                const size_t offset = W.start[e];
-                down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+            // IK2_PF_NVFP4=1: an NVFP4 layer's experts as one grouped GEMM each way (k::experts_pf_nvfp4: the weights
+            // decoded in shared memory), instead of each expert decoded to FP16 in VRAM and a cuBLAS GEMM
+            static const bool pf_nvfp4 = getenv("IK2_PF_NVFP4") && atoi(getenv("IK2_PF_NVFP4"));
+            const bool grouped = pf_nvfp4 && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 &&
+                                 Ly.ty[2] == k::kNVFP4 && Ly.eb[0] == (size_t) F * C / 64 * 36 &&
+                                 k::experts_pf_nvfp4_fits(C, 2 * F) && k::experts_pf_nvfp4_fits(F, C);
+            if (grouped) {
+                static k::PfTile* tiles_h[2] = {nullptr, nullptr};
+                static k::PfTile* tiles_d[2] = {nullptr, nullptr};
+                static int tiles_cap = 0;
+                static const int bm = getenv("IK2_PF_BM") && atoi(getenv("IK2_PF_BM")) == 64 ? 64 : 128;
+                const int need = c.E + S / 64 + 1;
+                if (need > tiles_cap) {
+                    CU(cudaDeviceSynchronize());
+                    for (int b = 0; b < 2; ++b) {
+                        if (tiles_h[b]) {
+                            CU(cudaFreeHost(tiles_h[b]));
+                            CU(cudaFree(tiles_d[b]));
+                        }
+                        CU(cudaHostAlloc(&tiles_h[b], (size_t) need * sizeof(k::PfTile), cudaHostAllocPortable));
+                        CU(cudaMalloc(&tiles_d[b], (size_t) need * sizeof(k::PfTile)));
+                    }
+                    tiles_cap = need;
+                }
+                k::PfTile* th = tiles_h[ps];
+                int nt = 0;
+                for (int e : X.hit_exps)
+                    for (int m = 0; m < W.cnt[e]; m += bm)
+                        th[nt++] = {{X.slot_ptrs[e], X.slot_ptrs[e] + Ly.eb[0] + Ly.eb[1]}, W.start[e] + m,
+                                    std::min(bm, W.cnt[e] - m)};
+                CU(cudaMemcpyAsync(tiles_d[ps], th, (size_t) nt * sizeof(k::PfTile), cudaMemcpyHostToDevice, g_s));
+                k::experts_pf_nvfp4(tiles_d[ps], nt, bm, 0, sorted_input, C, 2 * F, X.gu32, g_s);
+                k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+                k::experts_pf_nvfp4(tiles_d[ps], nt, bm, 1, sorted_input, F, C, sorted_out, g_s);
+            } else {
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
+                }
+                k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+                }
             }
             combine_prefill_groups<<<T, 256, 0, g_s>>>(sorted_out, X.inv, X.wtr, C, c.K, X.tmp);
             X.pf_layers[l % Work::kPfRing] = -1;
