@@ -2310,7 +2310,7 @@ struct FastGraph {
 };
 bool tier_active = false;
 bool stage_cold = false;
-FastGraph g_fgraph[2][4]; // by tier, OutMode (single active slot, evicted on slot switch)
+FastGraph g_fgraph[2][2][4]; // by tier, skip_ref_head, OutMode (single active slot, evicted on slot switch)
 int g_fgraph_slot = -1;
 
 struct HostExpertPlan {
@@ -2386,11 +2386,12 @@ void prepare_host_experts(Model& model, size_t bytes_needed, int depth) {
     // A captured host node owns a stable pointer to each selected packed layer.
     // Synchronize before replacing the graph for a different placement.
     CU(cudaStreamSynchronize(g_s));
-    for (auto& graph : g_fgraph[1]) {
-        if (graph.exec) CU(cudaGraphExecDestroy(graph.exec));
-        if (graph.graph) CU(cudaGraphDestroy(graph.graph));
-        graph = {};
-    }
+    for (int s = 0; s < 2; ++s)
+        for (auto& graph : g_fgraph[1][s]) {
+            if (graph.exec) CU(cudaGraphExecDestroy(graph.exec));
+            if (graph.graph) CU(cudaGraphDestroy(graph.graph));
+            graph = {};
+        }
     host_plan.active = std::move(active);
     if (!threads) host_plan.packed.clear();
     std::fprintf(stderr, "deep CPU: %zu layers, %d threads, placement %.2f s\n",
@@ -2414,7 +2415,7 @@ __global__ void stage_selected_experts(const uint8_t* const* table, const uint8_
         selected[slot] = (const uint8_t*)dst;
 }
 
-void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
+void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0, bool skip_ref_head = false) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
@@ -2667,35 +2668,41 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head
-        k::ResStates st{};
-        for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
-        st.st[nb] = W.h;
-        k::RmsOuts outs{};
-        outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
-        k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
-        if (g_loopcd) {
+        const bool guide_now = g_loopcd && !skip_ref_head;
+        if (g_loopcd && skip_ref_head) {
             mv1(M.out_w, W.lcd_out, W.logits);
-            mv1(M.out_w, W.xq, W.lcd_logits);
-            if (g_loopcd_skip_thinking)
-                CU(cudaMemcpyAsync(W.lcd_think_d, W.lcd_think_h, 1, cudaMemcpyHostToDevice, g_s));
-            k::loopcd_guide(W.logits, W.lcd_logits, c.n_rows, c.n_vocab, 1, c.logit_cap, g_loopcd_alpha,
-                            g_loopcd_skip_thinking ? W.lcd_think_d : nullptr, g_loopcd_skip_thinking,
-                            kLoopCdFirstControl, W.lcd_scratch, g_s);
         } else {
-            if (g_taps)
-                CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, Cb, cudaMemcpyDeviceToDevice, g_s));
-            mv1(M.out_w, W.xq, W.logits);
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.h;
+            k::RmsOuts outs{};
+            outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+            k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
+            if (g_loopcd) {
+                mv1(M.out_w, W.lcd_out, W.logits);
+                mv1(M.out_w, W.xq, W.lcd_logits);
+                if (g_loopcd_skip_thinking)
+                    CU(cudaMemcpyAsync(W.lcd_think_d, W.lcd_think_h, 1, cudaMemcpyHostToDevice, g_s));
+                k::loopcd_guide(W.logits, W.lcd_logits, c.n_rows, c.n_vocab, 1, c.logit_cap, g_loopcd_alpha,
+                                g_loopcd_skip_thinking ? W.lcd_think_d : nullptr, g_loopcd_skip_thinking,
+                                kLoopCdFirstControl, W.lcd_scratch, g_s);
+            } else {
+                if (g_taps)
+                    CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, Cb,
+                                       cudaMemcpyDeviceToDevice, g_s));
+                mv1(M.out_w, W.xq, W.logits);
+            }
         }
-        const float cap_hi = loopcd_cand_bound(c);
+        const float cap_hi = guide_now ? loopcd_cand_bound(c) : c.logit_cap;
         if (out_mode == OutMode::kArgmax) {
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
         } else if (out_mode == OutMode::kCand) {   // (the softcap keeps the logits within +- logit_cap)
-            if (!g_loopcd) k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
+            if (!guide_now) k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
             k::cand_topk(W.logits, c.n_vocab, -cap_hi, cap_hi, kCandK, kCandCap, W.cand_part, W.cand_d, g_s);
             CU(cudaMemcpyAsync(W.cand_h, W.cand_d, (size_t) (2 + 2 * kCandCap) * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
-            if (!g_loopcd) k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
+            if (!guide_now) k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
             CU(cudaMemcpyAsync(W.logits_h, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
         }
     }
@@ -2709,29 +2716,33 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
+    bool skip_ref_head = false;
     if (g_loopcd && g_loopcd_skip_thinking) {
         if (tok >= kLoopCdFirstControl) g_loopcd_thinking = (tok == kLoopCdThinkingToken) ? 1 : 0;
         W.lcd_think_h[0] = g_loopcd_thinking;
+        skip_ref_head = g_loopcd_thinking != 0;
     }
     if (!g_graph) {
-        fast_token_launches(M, W, out_mode, slot);
+        fast_token_launches(M, W, out_mode, slot, skip_ref_head);
     } else {
         if (g_fgraph_slot != slot) {
             CU(cudaStreamSynchronize(g_s));
             for (int t = 0; t < 2; ++t)
-                for (int m = 0; m < 4; ++m) {
-                    if (g_fgraph[t][m].exec) CU(cudaGraphExecDestroy(g_fgraph[t][m].exec));
-                    if (g_fgraph[t][m].graph) CU(cudaGraphDestroy(g_fgraph[t][m].graph));
-                    g_fgraph[t][m] = {};
-                }
+                for (int s = 0; s < 2; ++s)
+                    for (int m = 0; m < 4; ++m) {
+                        if (g_fgraph[t][s][m].exec) CU(cudaGraphExecDestroy(g_fgraph[t][s][m].exec));
+                        if (g_fgraph[t][s][m].graph) CU(cudaGraphDestroy(g_fgraph[t][s][m].graph));
+                        g_fgraph[t][s][m] = {};
+                    }
             g_fgraph_slot = slot;
         }
         FastGraph& G = g_fgraph
                                [(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced]
+                               [skip_ref_head ? 1 : 0]
                                [(int) out_mode];
         if (!G.exec) {   // the first token of this kind: its launches recorded
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_token_launches(M, W, out_mode, slot);
+            fast_token_launches(M, W, out_mode, slot, skip_ref_head);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
@@ -2777,7 +2788,7 @@ struct BlockBufs {
     uint8_t* lcd_think_h = nullptr;             // pinned [kBlockMax]: LoopCD thinking flags per window row
 };
 BlockBufs g_blk;
-FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode (single active slot, evicted on slot switch)
+FastGraph g_bgraph[kBlockMax + 1][2][4];   // by window size, skip_ref_head, and OutMode (single active slot)
 int g_bgraph_slot = -1;
 FastGraph g_mgraph[kMaxParallel + 1][2][4];           // multi-slot batch: by B, context tier, and OutMode
 
@@ -2824,7 +2835,7 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
     k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
 }
 
-void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 0) {
+void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 0, bool skip_ref_head = false) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
     const size_t TC = (size_t) T * C, TCb = TC * 4;
@@ -3027,39 +3038,46 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits
-        k::ResStates st{};
-        for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
-        st.st[nb] = W.h;
-        k::RmsOuts outs{};
-        outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
-        k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
-        if (g_loopcd) {
-            tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.lcd_logits, c.n_rows);
+        const bool guide_now = g_loopcd && !skip_ref_head;
+        if (g_loopcd && skip_ref_head) {
             k::to_f16(W.lcd_out, TC, W.x16, g_s);
             tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
-            if (g_loopcd_skip_thinking)
-                CU(cudaMemcpyAsync(W.lcd_think_d, g_blk.lcd_think_h, (size_t) T, cudaMemcpyHostToDevice, g_s));
-            k::loopcd_guide(W.logits, W.lcd_logits, c.n_rows, c.n_vocab, T, c.logit_cap, g_loopcd_alpha,
-                            g_loopcd_skip_thinking ? W.lcd_think_d : nullptr, g_loopcd_skip_thinking,
-                            kLoopCdFirstControl, W.lcd_scratch, g_s);
         } else {
-            if (g_taps)
-                CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
-            tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.h;
+            k::RmsOuts outs{};
+            outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+            k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+            if (g_loopcd) {
+                tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.lcd_logits, c.n_rows);
+                k::to_f16(W.lcd_out, TC, W.x16, g_s);
+                tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+                if (g_loopcd_skip_thinking)
+                    CU(cudaMemcpyAsync(W.lcd_think_d, g_blk.lcd_think_h, (size_t) T, cudaMemcpyHostToDevice, g_s));
+                k::loopcd_guide(W.logits, W.lcd_logits, c.n_rows, c.n_vocab, T, c.logit_cap, g_loopcd_alpha,
+                                g_loopcd_skip_thinking ? W.lcd_think_d : nullptr, g_loopcd_skip_thinking,
+                                kLoopCdFirstControl, W.lcd_scratch, g_s);
+            } else {
+                if (g_taps)
+                    CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb,
+                                       cudaMemcpyDeviceToDevice, g_s));
+                tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+            }
         }
-        const float cap_hi = loopcd_cand_bound(c);
+        const float cap_hi = guide_now ? loopcd_cand_bound(c) : c.logit_cap;
         if (out_mode == OutMode::kArgmax) {
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
         } else if (out_mode == OutMode::kCand) {   // (each row's candidates, as the token path's)
             const size_t cs = 2 + 2 * (size_t) kCandCap;
-            if (!g_loopcd) k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
+            if (!guide_now) k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
                 k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -cap_hi, cap_hi, kCandK, kCandCap,
                              W.cand_part, g_blk.cand_d + t * cs, g_s);
             CU(cudaMemcpyAsync(g_blk.cand_h, g_blk.cand_d, (size_t) T * cs * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
-            if (!g_loopcd) k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
+            if (!guide_now) k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
                 CU(cudaMemcpyAsync(g_blk.logits_h + (size_t) t * c.n_vocab, W.logits + (size_t) t * c.n_rows,
                                    (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
@@ -3080,31 +3098,35 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
         g_blk.pos_h[t] = pos0 + t;
     }
+    bool skip_ref_head = false;
     if (g_loopcd && g_loopcd_skip_thinking) {
         uint8_t th = g_loopcd_thinking;
+        skip_ref_head = true;
         for (int t = 0; t < T; ++t) {
             if (tok[t] >= kLoopCdFirstControl) th = (tok[t] == kLoopCdThinkingToken) ? 1 : 0;
             g_blk.lcd_think_h[t] = th;
+            if (!th) skip_ref_head = false;
         }
         g_loopcd_thinking = th;
     }
     if (!g_graph) {
-        fast_block_launches(M, W, T, out_mode, slot);
+        fast_block_launches(M, W, T, out_mode, slot, skip_ref_head);
     } else {
         if (g_bgraph_slot != slot) {
             CU(cudaStreamSynchronize(g_s));
             for (int k = 0; k <= kBlockMax; ++k)
-                for (int m = 0; m < 4; ++m) {
-                    if (g_bgraph[k][m].exec) CU(cudaGraphExecDestroy(g_bgraph[k][m].exec));
-                    if (g_bgraph[k][m].graph) CU(cudaGraphDestroy(g_bgraph[k][m].graph));
-                    g_bgraph[k][m] = {};
-                }
+                for (int s = 0; s < 2; ++s)
+                    for (int m = 0; m < 4; ++m) {
+                        if (g_bgraph[k][s][m].exec) CU(cudaGraphExecDestroy(g_bgraph[k][s][m].exec));
+                        if (g_bgraph[k][s][m].graph) CU(cudaGraphDestroy(g_bgraph[k][s][m].graph));
+                        g_bgraph[k][s][m] = {};
+                    }
             g_bgraph_slot = slot;
         }
-        FastGraph& G = g_bgraph[T][(int) out_mode];
+        FastGraph& G = g_bgraph[T][skip_ref_head ? 1 : 0][(int) out_mode];
         if (!G.exec) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_block_launches(M, W, T, out_mode, slot);
+            fast_block_launches(M, W, T, out_mode, slot, skip_ref_head);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
