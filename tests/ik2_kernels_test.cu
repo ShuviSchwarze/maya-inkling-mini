@@ -3124,6 +3124,97 @@ void test_experts_pf_nvfp4() {
     }
 }
 
+static void test_gemv_f16_add_inplace() {
+    const int R = 256, n = 200058, ld = (n + 7) & ~7;
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<float> ud(-0.25f, 0.25f);
+    std::vector<float> x(R), base(ld, 0.0f), wf(R * ld, 0.0f), bf(ld, 0.0f);
+    std::vector<uint16_t> w16((size_t) R * ld, 0), b16(ld, 0);
+    for (int r = 0; r < R; ++r) x[r] = ud(rng);
+    for (int v = 0; v < n; ++v) {
+        base[v] = ud(rng) * 4.0f;
+        bf[v] = ud(rng);
+        b16[v] = __half_as_ushort(__float2half(bf[v]));
+        bf[v] = __half2float(__ushort_as_half(b16[v]));
+    }
+    for (int r = 0; r < R; ++r)
+        for (int v = 0; v < n; ++v) {
+            const uint16_t h = __half_as_ushort(__float2half(ud(rng)));
+            w16[(size_t) r * ld + v] = h;
+            wf[(size_t) r * ld + v] = __half2float(__ushort_as_half(h));
+        }
+    std::vector<double> want(n);
+    for (int v = 0; v < n; ++v) {
+        double a = (double) base[v] + (double) bf[v];
+        for (int r = 0; r < R; ++r) a += (double) wf[(size_t) r * ld + v] * (double) x[r];
+        want[v] = a;
+    }
+    uint16_t *dw = dev(w16), *db = dev(b16);
+    float *dx = dev(x), *dbase = dev(base);
+    k::gemv_f16_add_inplace(dw, ld, dx, dbase, db, R, n, 0);
+    auto got = host(dbase, n);
+    expect("gemv_f16_add_inplace 256x200058", got, want, 1e-4, 1e-4);
+    cudaFree(dw), cudaFree(db), cudaFree(dx), cudaFree(dbase);
+}
+
+static void test_spec_stochastic_exact() {
+    // Verify Leviathan min(1, p/q) + norm(max(0, p-q)) reproduces p(x) exactly across mismatched supports
+    struct Case {
+        const char* name;
+        std::vector<double> p, q;
+    };
+    const std::vector<Case> cases = {
+        {"matched", {0.40, 0.25, 0.20, 0.10, 0.05}, {0.40, 0.25, 0.20, 0.10, 0.05}},
+        {"loopcd_shifted", {0.55, 0.08, 0.30, 0.05, 0.02, 0.00}, {0.30, 0.25, 0.15, 0.15, 0.10, 0.05}},
+        {"disjoint_tail", {0.50, 0.30, 0.20, 0.00, 0.00}, {0.10, 0.00, 0.40, 0.30, 0.20}},
+    };
+    std::mt19937_64 rng(20261127);
+    const int N = 200000;
+    for (const auto& cs : cases) {
+        const int K = (int) cs.p.size();
+        std::vector<int> cnt(K, 0);
+        for (int it = 0; it < N; ++it) {
+            double uq = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+            int d = K - 1;
+            for (int i = 0; i < K; ++i) {
+                uq -= cs.q[i];
+                if (uq <= 0.0) { d = i; break; }
+            }
+            const double accept = cs.q[d] > 0.0 ? std::min(1.0, cs.p[d] / cs.q[d]) : 0.0;
+            if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < accept) {
+                ++cnt[d];
+            } else {
+                double zr = 0.0;
+                std::vector<double> rv(K, 0.0);
+                for (int i = 0; i < K; ++i) {
+                    rv[i] = cs.p[i] > cs.q[i] ? (cs.p[i] - cs.q[i]) : 0.0;
+                    zr += rv[i];
+                }
+                double ur = std::uniform_real_distribution<double>(0.0, zr)(rng);
+                int pick = K - 1;
+                for (int i = 0; i < K; ++i) {
+                    ur -= rv[i];
+                    if (ur <= 0.0) { pick = i; break; }
+                }
+                ++cnt[pick];
+            }
+        }
+        double chi2 = 0.0;
+        bool ok = true;
+        for (int i = 0; i < K; ++i) {
+            if (cs.p[i] == 0.0) {
+                if (cnt[i] != 0) ok = false;
+            } else {
+                const double e = N * cs.p[i];
+                chi2 += (cnt[i] - e) * (cnt[i] - e) / e;
+            }
+        }
+        // df <= 5 -> chi2 < 25 has p > 1.4e-4
+        ok = ok && chi2 < 25.0;
+        expect_true((std::string("spec_stochastic_exact ") + cs.name).c_str(), ok);
+    }
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3160,6 +3251,8 @@ int main() {
     test_attn_slots();
     test_loopcd_guide();
     test_experts_pf_nvfp4();
+    test_gemv_f16_add_inplace();
+    test_spec_stochastic_exact();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -173,6 +173,10 @@ struct Drafter {
     int graph_n_rows = 0, graph_n_vocab = 0;
     cudaGraph_t pgraph[kBlock] = {};
     cudaGraphExec_t pexec[kBlock] = {};
+    cudaGraph_t pbgraph[kBlock] = {};
+    cudaGraphExec_t pbexec[kBlock] = {};
+    int *cand_part = nullptr, *cand_d = nullptr, *cand_h = nullptr, *h_tok_in = nullptr;
+    int cand_n_vocab = 0;
     const float* ctx_graph_taps = nullptr;
     int ctx_graph_ld = 0;
     cudaGraph_t cgraph[kBlock + 1] = {};
@@ -902,6 +906,181 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         }
     }
     std::memcpy(out, d->h_out, proposals * sizeof(int));
+}
+
+namespace {
+constexpr int kDraftCandK = 1000, kDraftCandCap = 4096;
+
+void sample_draft_dist(std::vector<std::pair<float, int>>& cd, double temp, double top_p, int top_k,
+                       std::mt19937_64& rng, DraftDist& out) {
+    const int kk = std::min((int) cd.size(), top_k > 0 ? std::min(top_k, kDraftCandK) : kDraftCandK);
+    auto cmp = [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    };
+    float vmax;
+    if (top_p >= 1.0) {
+        if (kk < (int) cd.size()) std::nth_element(cd.begin(), cd.begin() + kk, cd.end(), cmp);
+        vmax = cd[0].first;
+        for (int j = 1; j < kk; ++j)
+            if (cd[j].first > vmax) vmax = cd[j].first;
+    } else {
+        std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(), cmp);
+        vmax = cd[0].first;
+    }
+    static double pr[kDraftCandK];
+    const double inv_t = 1.0 / temp;
+    double z = 0.0;
+    for (int j = 0; j < kk; ++j) {
+        const double p = std::exp(((double) cd[j].first - (double) vmax) * inv_t);
+        pr[j] = p;
+        z += p;
+    }
+    int keep = kk;
+    double zk = z;
+    if (top_p < 1.0) {
+        const double thresh = top_p * z;
+        double acc = 0.0;
+        for (int j = 0; j < kk; ++j) {
+            acc += pr[j];
+            if (acc >= thresh) {
+                keep = j + 1;
+                zk = acc;
+                break;
+            }
+        }
+    }
+    out.q.resize(keep);
+    const double inv_zk = zk > 0.0 ? (1.0 / zk) : 0.0;
+    double sum_q = 0.0;
+    for (int j = 0; j < keep; ++j) {
+        const float qv = (float) (pr[j] * inv_zk);
+        out.q[j] = {cd[j].second, qv};
+        sum_q += (double) qv;
+    }
+    // Re-normalize in float so sum(out.q) matches the exact sampling weights
+    if (sum_q > 0.0) {
+        const double inv_sq = 1.0 / sum_q;
+        for (int j = 0; j < keep; ++j) out.q[j].second = (float) ((double) out.q[j].second * inv_sq);
+    } else if (keep > 0) {
+        out.q[0].second = 1.0f;
+    }
+    double tot = 0.0;
+    for (int j = 0; j < keep; ++j) tot += (double) out.q[j].second;
+    double u = std::uniform_real_distribution<double>(0.0, tot)(rng);
+    int pick = keep - 1;
+    for (int j = 0; j < keep; ++j) {
+        u -= (double) out.q[j].second;
+        if (u <= 0.0) {
+            pick = j;
+            break;
+        }
+    }
+    out.tok = out.q[pick].first;
+    out.q_tok = out.q[pick].second;
+}
+}  // namespace
+
+void propose_sample(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows,
+                    int n_vocab, float logit_cap, double temp, double top_p, int top_k, std::mt19937_64& rng,
+                    DraftDist* out, int proposals, bool* captured) {
+    if (captured) *captured = false;
+    if (!d->cand_h || d->cand_n_vocab < n_vocab) {
+        if (d->cand_part) cudaFree(d->cand_part);
+        if (d->cand_d) cudaFree(d->cand_d);
+        if (d->cand_h) cudaFreeHost(d->cand_h);
+        if (!d->h_tok_in) cu(cudaHostAlloc(&d->h_tok_in, sizeof(int), cudaHostAllocDefault), "h_tok_in");
+        d->cand_part = dalloc<int>(k::cand_scratch(n_vocab));
+        d->cand_d = dalloc<int>(2 + 2 * kDraftCandCap);
+        cu(cudaHostAlloc(&d->cand_h, (size_t) (2 + 2 * kDraftCandCap) * sizeof(int), cudaHostAllocDefault), "cand_h");
+        d->cand_n_vocab = n_vocab;
+    }
+    static const bool use_graph = !(getenv("IK2_DRAFT_GRAPH") && !atoi(getenv("IK2_DRAFT_GRAPH")));
+    const int C = d->C, T = kBlock;
+    const int fld = d->shortlist ? n_rows : d->fold_ld;
+    auto launch_base = [&](bool graphed) {
+        if (graphed) {
+            cu(cudaMemcpyAsync(d->meta_d, d->meta_h, 2 * sizeof(int), cudaMemcpyHostToDevice, d->s), "meta");
+            init_block_at_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
+                anchor_h, d->mask, d->res, d->pos, d->toks, T, C, d->meta_d);
+        } else {
+            init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
+                anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor);
+        }
+        for (size_t i = 0; i < d->L.size(); ++i) {
+            DLayer& l = d->L[i];
+            if (i == 0)
+                draft_add_rms_bf16_kernel<false><<<(unsigned) T, 256, 0, d->s>>>(d->x, d->res, l.in_norm, C, d->eps, d->hb);
+            else
+                draft_add_rms_bf16_kernel<true><<<(unsigned) T, 256, 0, d->s>>>(d->x, d->res, l.in_norm, C, d->eps, d->hb);
+            layer_attn(d, l, P, d->x, graphed ? d->meta_d : nullptr);
+            draft_add_rms_bf16_kernel<true><<<(unsigned) T, 256, 0, d->s>>>(d->x, d->res, l.post_norm, C, d->eps, d->hb);
+            layer_mlp(d, l, d->x);
+        }
+        draft_final_rms_f16_kernel<<<(unsigned) T, 256, 0, d->s>>>(d->x, d->res, d->norm, C, d->eps, proposals, d->h, d->x16);
+        if (d->head_q8)
+            k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, fld, d->s);
+        else
+            gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, fld);
+        cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");
+    };
+    const bool can_graph = use_graph && d->blas_warmed && proposals >= 1 && proposals < kBlock &&
+                           (!d->graph_anchor || (d->graph_anchor == anchor_h && d->graph_lm == lm_f16 &&
+                                                 d->graph_n_rows == n_rows && d->graph_n_vocab == n_vocab));
+    if (can_graph) {
+        d->meta_h[0] = P;
+        d->meta_h[1] = anchor;
+        if (!d->pbexec[proposals]) {
+            if (captured) *captured = true;
+            d->graph_anchor = anchor_h;
+            d->graph_lm = lm_f16;
+            d->graph_n_rows = n_rows;
+            d->graph_n_vocab = n_vocab;
+            cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeGlobal), "draft base capture begin");
+            launch_base(true);
+            cu(cudaStreamEndCapture(d->s, &d->pbgraph[proposals]), "draft base capture end");
+            cu(cudaGraphInstantiate(&d->pbexec[proposals], d->pbgraph[proposals], 0), "draft base graph inst");
+        }
+        cu(cudaGraphLaunch(d->pbexec[proposals], d->s), "draft base graph launch");
+    } else {
+        if (captured) *captured = true;
+        launch_base(false);
+        d->blas_warmed = true;
+    }
+
+    static std::vector<std::pair<float, int>> cd_buf;
+    for (int t = 0; t < proposals; ++t) {
+        k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in, d->s);
+        gemm_bf(d, d->rnn_w, 3 * d->R, 2 * d->R + 2 * C, d->rnn_in, 1, d->proj, 3 * d->R);
+        k::rnn_gates(d->proj, d->rnn_b, d->R, d->state, d->latent, d->s);
+        float* row_logits = d->base + (size_t) t * fld;
+        k::gemv_f16_add_inplace(d->fold_w, fld, d->latent, row_logits, d->fold_b, d->R, n_vocab, d->s);
+        k::cand_topk_softcap_rows(row_logits, fld, 1, n_vocab, logit_cap, kDraftCandK, kDraftCandCap, d->cand_part,
+                                  d->cand_d, 2 + 2 * kDraftCandCap, d->s);
+        cu(cudaMemcpyAsync(d->cand_h, d->cand_d, (size_t) (2 + 2 * kDraftCandCap) * sizeof(int),
+                           cudaMemcpyDeviceToHost, d->s),
+           "draft cand");
+        cu(cudaStreamSynchronize(d->s), "propose_sample step");
+        const int n_cand = d->cand_h[0];
+        if (n_cand <= kDraftCandCap) {
+            const int* idx = d->cand_h + 2;
+            const float* val = (const float*) (d->cand_h + 2 + kDraftCandCap);
+            cd_buf.resize(n_cand);
+            for (int i = 0; i < n_cand; ++i) cd_buf[i] = {val[i], idx[i]};
+        } else {
+            std::vector<float> full((size_t) n_vocab);
+            cu(cudaMemcpy(full.data(), row_logits, (size_t) n_vocab * sizeof(float), cudaMemcpyDeviceToHost),
+               "draft cand fallback");
+            const float inv_cap = logit_cap > 0.0f ? (1.0f / logit_cap) : 0.0f;
+            cd_buf.resize(n_vocab);
+            for (int v = 0; v < n_vocab; ++v)
+                cd_buf[v] = {logit_cap > 0.0f ? (logit_cap * std::tanh(full[v] * inv_cap)) : full[v], v};
+        }
+        sample_draft_dist(cd_buf, temp, top_p, top_k, rng, out[t]);
+        if (t + 1 < proposals) {
+            *d->h_tok_in = out[t].tok;
+            cu(cudaMemcpyAsync(d->toks + t + 1, d->h_tok_in, sizeof(int), cudaMemcpyHostToDevice, d->s), "draft tok");
+        }
+    }
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }

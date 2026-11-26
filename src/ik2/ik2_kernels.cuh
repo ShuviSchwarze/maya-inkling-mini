@@ -438,6 +438,9 @@ void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaS
 /// x is [R] F32, base (optional) is [n] F32, bias_f16 (optional) is [n] FP16.  Ties: the lower index.
 void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* base, const uint16_t* bias_f16,
                      int R, int n, int* out, cudaStream_t s);
+/// base[v] += (bias_f16 ? bias_f16[v] : 0) + sum_{r<R} W[r * ld + v] * x[r] for 0 <= v < n (W [R][ld] FP16).
+void gemv_f16_add_inplace(const uint16_t* W, int ld, const float* x, float* base, const uint16_t* bias_f16,
+                          int R, int n, cudaStream_t s);
 
 // ---- the weights' decodes (ggml's block types; values exactly ggml's dequantize_row_*, then rounded to the output)
 

@@ -3929,8 +3929,20 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     embed_row(M, anchor, raw, anchor_h);
     const double t1 = spec_prof ? now() : 0.0;
     int dr[kBlockMax];
+    static ik2::draft::DraftDist ddist[kBlockMax];
+    static const bool draft_stoch = !(getenv("IK2_DRAFT_STOCHASTIC") && !atoi(getenv("IK2_DRAFT_STOCHASTIC"))) &&
+                                    !(getenv("IK2_DRAFT_SHORTLIST") && atoi(getenv("IK2_DRAFT_SHORTLIST")));
+    static const double draft_tscale = getenv("IK2_DRAFT_TEMP_SCALE") ? std::atof(getenv("IK2_DRAFT_TEMP_SCALE")) : 1.0;
+    const bool use_stoch = sc.temp > 0 && draft_stoch;
     bool draft_cap = false;
-    ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1, &draft_cap);
+    if (use_stoch) {
+        const double dtemp = std::max(1e-3, sc.temp * draft_tscale);
+        ik2::draft::propose_sample(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, c.logit_cap, dtemp,
+                                   sc.top_p, sc.top_k, *sc.rng, ddist, B - 1, &draft_cap);
+        for (int j = 0; j < B - 1; ++j) dr[j] = ddist[j].tok;
+    } else {
+        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1, &draft_cap);
+    }
     const double t2 = spec_prof ? now() : 0.0;
     int tk[kBlockMax];
     tk[0] = anchor;
@@ -3946,12 +3958,13 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         for (int j = 0; j < n; ++j) next.push_back(dr[j]);
         next.push_back(g[n]);
     } else {
-        // the drafts are the drafter's argmax (a point mass): accept draft d with the target's probability of it,
-        // else sample the target's distribution without d - the target's distribution exactly
         fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr, slot);
         g_last_captured = g_last_captured || draft_cap;
         static std::vector<std::pair<float, int>> cd_buf;
         static float pr_buf[kCandK];
+        static std::vector<float> q_lut;
+        static double res_buf[kCandK];
+        if (use_stoch && (int) q_lut.size() < c.n_vocab) q_lut.assign((size_t) c.n_vocab, 0.0f);
         for (int j = 0; j < B; ++j) {
             if (!block_cands(M, j, cd_buf)) {   // (more candidates than kept: the row's logits)
                 std::vector<float> row((size_t) c.n_vocab);
@@ -3974,11 +3987,50 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
                     pd_num = pr_buf[i];
                     break;
                 }
-            if (std::uniform_real_distribution<double>(0.0, (double) zk)(*sc.rng) < (double) pd_num) {
-                next.push_back(dr[j]);
+            if (use_stoch) {
+                // Exact Leviathan speculative sampling: accept with min(1, p(d)/q(d)), else sample norm(max(0, p - q))
+                const double p_d = zk > 0.0f ? ((double) pd_num / (double) zk) : 0.0;
+                const double q_d = (double) ddist[j].q_tok;
+                const double accept = (q_d > 0.0) ? std::min(1.0, p_d / q_d) : 0.0;
+                if (std::uniform_real_distribution<double>(0.0, 1.0)(*sc.rng) < accept) {
+                    next.push_back(dr[j]);
+                } else {
+                    const auto& qv = ddist[j].q;
+                    for (const auto& e : qv) q_lut[(size_t) e.first] = e.second;
+                    const double inv_zk = zk > 0.0f ? (1.0 / (double) zk) : 0.0;
+                    double z_res = 0.0;
+                    for (int i = 0; i < keep; ++i) {
+                        const double p_i = (double) pr_buf[i] * inv_zk;
+                        const double q_i = (double) q_lut[(size_t) cd_buf[i].second];
+                        const double r_i = p_i > q_i ? (p_i - q_i) : 0.0;
+                        res_buf[i] = r_i;
+                        z_res += r_i;
+                    }
+                    for (const auto& e : qv) q_lut[(size_t) e.first] = 0.0f;
+                    if (z_res > 0.0) {
+                        double u = std::uniform_real_distribution<double>(0.0, z_res)(*sc.rng);
+                        int pick = keep - 1;
+                        for (int i = 0; i < keep; ++i) {
+                            u -= res_buf[i];
+                            if (u <= 0.0) {
+                                pick = i;
+                                break;
+                            }
+                        }
+                        next.push_back(cd_buf[pick].second);
+                    } else {
+                        next.push_back(sample_from_pr(cd_buf, pr_buf, keep, zk, *sc.rng));
+                    }
+                    break;
+                }
             } else {
-                next.push_back(sample_from_pr(cd_buf, pr_buf, keep, zk, *sc.rng, dr[j]));
-                break;
+                // Point-mass fallback (IK2_DRAFT_STOCHASTIC=0): accept with p(d), else sample p without d
+                if (std::uniform_real_distribution<double>(0.0, (double) zk)(*sc.rng) < (double) pd_num) {
+                    next.push_back(dr[j]);
+                } else {
+                    next.push_back(sample_from_pr(cd_buf, pr_buf, keep, zk, *sc.rng, dr[j]));
+                    break;
+                }
             }
         }
     }
@@ -7570,7 +7622,10 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (top >= 0 && snaps[top].pos >= kParkLeast && snaps[top].pos > live + kParkGain)
+                const bool same_conv_rewind = top >= 0 && !back && live > 0 &&
+                                              (snaps[top].pos - live <= std::max(kParkGain, chunk) ||
+                                               (int64_t) live * 4 >= (int64_t) snaps[top].pos * 3);
+                if (top >= 0 && snaps[top].pos >= kParkLeast && snaps[top].pos > live + kParkGain && !same_conv_rewind)
                     park_live(snaps[top], back);
                 if (back) {
                     park_restore(*back, back_snap);

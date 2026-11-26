@@ -4914,6 +4914,76 @@ __global__ void argmax_gemv_f16_part_kernel(const uint16_t* W, int ld, const flo
     }
 }
 
+__global__ void gemv_f16_add_inplace_kernel(const uint16_t* __restrict__ W, int ld, const float* __restrict__ x,
+                                            float* __restrict__ base, const uint16_t* __restrict__ bias_f16, int R,
+                                            int n, bool use_smem) {
+    extern __shared__ float sx[];
+    if (use_smem) {
+        for (int r = threadIdx.x; r < R; r += blockDim.x) sx[r] = x[r];
+        __syncthreads();
+    }
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gstride = gridDim.x * blockDim.x;
+    const bool vec8 = (((uintptr_t) W & 15) == 0) && ((ld & 7) == 0) &&
+                      (((uintptr_t) base & 15) == 0) && (!bias_f16 || ((uintptr_t) bias_f16 & 15) == 0);
+    if (vec8) {
+        const int n8 = n >> 3;
+        for (int v8 = gtid; v8 < n8; v8 += gstride) {
+            const int v = v8 << 3;
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            float d4 = 0.0f, d5 = 0.0f, d6 = 0.0f, d7 = 0.0f;
+            const uint16_t* wr = W + v;
+#pragma unroll 4
+            for (int r = 0; r < R; ++r, wr += ld) {
+                const float xr = use_smem ? sx[r] : __ldg(x + r);
+                const uint4 w8 = __ldg((const uint4*) wr);
+                const float2 f0 = u32_to_f2(w8.x), f1 = u32_to_f2(w8.y);
+                const float2 f2 = u32_to_f2(w8.z), f3 = u32_to_f2(w8.w);
+                d0 = fmaf(f0.x, xr, d0);
+                d1 = fmaf(f0.y, xr, d1);
+                d2 = fmaf(f1.x, xr, d2);
+                d3 = fmaf(f1.y, xr, d3);
+                d4 = fmaf(f2.x, xr, d4);
+                d5 = fmaf(f2.y, xr, d5);
+                d6 = fmaf(f3.x, xr, d6);
+                d7 = fmaf(f3.y, xr, d7);
+            }
+            const float4 bs0 = ((const float4*) (base + v))[0];
+            const float4 bs1 = ((const float4*) (base + v + 4))[0];
+            d0 += bs0.x, d1 += bs0.y, d2 += bs0.z, d3 += bs0.w;
+            d4 += bs1.x, d5 += bs1.y, d6 += bs1.z, d7 += bs1.w;
+            if (bias_f16) {
+                const uint4 b8 = __ldg((const uint4*) (bias_f16 + v));
+                const float2 f0 = u32_to_f2(b8.x), f1 = u32_to_f2(b8.y);
+                const float2 f2 = u32_to_f2(b8.z), f3 = u32_to_f2(b8.w);
+                d0 += f0.x, d1 += f0.y, d2 += f1.x, d3 += f1.y;
+                d4 += f2.x, d5 += f2.y, d6 += f3.x, d7 += f3.y;
+            }
+            ((float4*) (base + v))[0] = make_float4(d0, d1, d2, d3);
+            ((float4*) (base + v + 4))[0] = make_float4(d4, d5, d6, d7);
+        }
+        for (int v = (n8 << 3) + gtid; v < n; v += gstride) {
+            float d = 0.0f;
+            const uint16_t* wr = W + v;
+            for (int r = 0; r < R; ++r, wr += ld)
+                d = fmaf(h2f(__ldg(wr)), use_smem ? sx[r] : __ldg(x + r), d);
+            d += base[v];
+            if (bias_f16) d += h2f(__ldg(bias_f16 + v));
+            base[v] = d;
+        }
+    } else {
+        for (int v = gtid; v < n; v += gstride) {
+            float d = 0.0f;
+            const uint16_t* wr = W + v;
+            for (int r = 0; r < R; ++r, wr += ld)
+                d = fmaf(h2f(__ldg(wr)), use_smem ? sx[r] : __ldg(x + r), d);
+            d += base[v];
+            if (bias_f16) d += h2f(__ldg(bias_f16 + v));
+            base[v] = d;
+        }
+    }
+}
+
 __global__ void argmax_final_kernel(int n_partials, int stride_partials, int* out) {
     const int r = blockIdx.x;
     float best = -INFINITY;
@@ -7146,6 +7216,19 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
     check("argmax_gemv_f16_part");
     argmax_final_kernel<<<1, 256, 0, s>>>(B, 1, out);
     check("argmax_gemv_f16_final");
+}
+
+void gemv_f16_add_inplace(const uint16_t* W, int ld, const float* x, float* base, const uint16_t* bias_f16, int R,
+                          int n, cudaStream_t s) {
+    if (n <= 0) return;
+    const bool vec8 = (((uintptr_t) W & 15) == 0) && ((ld & 7) == 0) &&
+                      (((uintptr_t) base & 15) == 0) && (!bias_f16 || ((uintptr_t) bias_f16 & 15) == 0);
+    const int nv = std::max(1, vec8 ? ((n + 7) >> 3) : n);
+    const int B = std::min(512, std::max(1, (nv + 127) / 128));
+    const bool use_smem = R <= 4096;
+    const size_t smem = use_smem ? (size_t) R * sizeof(float) : 0;
+    gemv_f16_add_inplace_kernel<<<B, 128, smem, s>>>(W, ld, x, base, bias_f16, R, n, use_smem);
+    check("gemv_f16_add_inplace");
 }
 
 int block_values(int type) {

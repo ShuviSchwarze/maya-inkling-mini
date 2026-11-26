@@ -18,12 +18,21 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ik2::draft {
 
 struct Drafter;
+
+/// One sampled draft token together with the exact normalized discrete distribution q it was drawn from.
+struct DraftDist {
+    int tok = 0;
+    float q_tok = 1.0f;
+    std::vector<std::pair<int, float>> q;   // (token_id, q(token)) over truncated support, sum == 1
+};
 
 /// The target's layers whose stream is a tap (at their start), the final normed hidden being tap 7.
 const std::vector<int>& tap_layers();
@@ -44,6 +53,11 @@ void commit_context(Drafter* d, const float* taps, int ld, int m, int pos0, bool
 /// lm_f16: the target's output head; n_vocab: the real rows (the argmax's range).
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
              int* out, int proposals = kBlock - 1, bool* captured = nullptr);
+/// Stochastic drafting for temperature > 0: samples each draft token sequentially from the drafter's softcapped
+/// distribution q(· | temp, top_p, top_k) and returns the exact normalized q for Leviathan min(1, p/q) verification.
+void propose_sample(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows,
+                    int n_vocab, float logit_cap, double temp, double top_p, int top_k, std::mt19937_64& rng,
+                    DraftDist* out, int proposals = kBlock - 1, bool* captured = nullptr);
 /// The base logits through the target's head kept as planar Q8_0 (int8 [n_rows][C], FP16 scales [n_rows][C / 32]):
 /// propose's lm_f16 is not read then (the FP16 copy is fold()'s only).
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
