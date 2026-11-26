@@ -3846,11 +3846,11 @@ struct SpecCtl {
     double c_plain = 5.3e-3, c[kBlockMax + 1] = {};
     double prior[kBlockMax + 1] = {0, 5.3e-3, 8.0e-3, 8.6e-3, 9.2e-3, 9.9e-3, 10.6e-3, 11.2e-3, 11.8e-3};
     bool seen_plain = false, seen[kBlockMax + 1] = {};
-    double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
+    double S = 3, F = 1;   // (the drafts accepted, the ones rejected: decayed counts; optimistic start)
     int plain_run = 0;
     int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 2;   // plain tokens before a look
     int probe_cur = 2;
-    int probe_w = 4;
+    int probe_w = 6;
     bool probing = false;
     double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
@@ -3902,7 +3902,7 @@ struct SpecCtl {
         const double cp = seen_plain ? c_plain : est_cost(1);
         if (probing) {
             if ((1.0 + acc) / est_cost(B) > 1.0 / cp) probe_cur = std::max(1, probe);
-            else probe_cur = std::min(24, std::max(1, probe_cur) * 2);
+            else probe_cur = std::min(12, std::max(1, probe_cur) * 2);
         } else {
             probe_cur = std::max(1, probe);
         }
@@ -7193,6 +7193,7 @@ int main(int argc, char** argv) {
             int pos = -1;
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
+            std::vector<uint8_t> draft;   // drafter local ring (+ f_rnn for DSpark) at `pos`
         };
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
         std::vector<Snap> snaps(8);
@@ -7247,11 +7248,22 @@ int main(int argc, char** argv) {
                 }
             }
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+            if (drafter && sn.pos > 0) {
+                if (save) {
+                    sn.draft.resize(ik2::draft::local_context_bytes(drafter, sn.pos));
+                    ik2::draft::save_local_context(drafter, sn.pos, sn.draft.data());
+                } else if (!sn.draft.empty()) {
+                    ik2::draft::load_local_context(drafter, sn.pos, sn.draft.data());
+                }
+            }
         };
         uint64_t live_park_id = 0;
         int live_park_clean = 0;   // global KV rows [0 .. live_park_clean) in VRAM are byte-identical to park live_park_id
         auto reset = [&]() {
-            for (auto& sn : snaps) sn.pos = -1;
+            for (auto& sn : snaps) {
+                sn.pos = -1;
+                sn.draft.clear();
+            }
             for (int vis = 0; vis < (int) M.V.size(); ++vis) {
                 Layer& Ly = bind_visit(M, vis);
                 use_dev(Ly.dev);
@@ -7523,8 +7535,12 @@ int main(int argc, char** argv) {
                 }
                 for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
                 if (drafter) {
-                    p->draft.reserve_uninit(ik2::draft::context_bytes(drafter, pos));
-                    ik2::draft::save_context(drafter, pos, p->draft.data());
+                    const size_t db = ik2::draft::context_bytes(drafter, pos);
+                    p->draft.reserve_uninit(db);
+                    if (ik2::draft::is_dflash2(drafter) && sn_top.draft.size() == db)
+                        std::memcpy(p->draft.data(), sn_top.draft.data(), db);
+                    else
+                        ik2::draft::save_context(drafter, pos, p->draft.data());
                 }
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "ik2 slots: a conversation of %d tokens not kept (no RAM for %.2f GiB)\n", pos, need / G);
@@ -7563,8 +7579,15 @@ int main(int argc, char** argv) {
             }
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
             sn.pos = pos;
+            sn.draft.clear();
             snap_copy(sn, false);   // (the conv histories and sliding windows into the visits; the snapshot stays)
-            if (drafter && !p.draft.empty()) ik2::draft::load_context(drafter, (int) p.ids.size(), p.draft.data());
+            if (drafter && !p.draft.empty()) {
+                ik2::draft::load_context(drafter, (int) p.ids.size(), p.draft.data());
+                if (ik2::draft::is_dflash2(drafter) && pos == (int) p.ids.size()) {
+                    sn.draft.resize(p.draft.size());
+                    std::memcpy(sn.draft.data(), p.draft.data(), p.draft.size());
+                }
+            }
             hist.assign(p.ids.begin(), p.ids.begin() + pos);
             hist_sig.assign(p.sig.begin(), p.sig.begin() + (long) std::min(p.sig.size(), (size_t) pos));
             last.clear();
@@ -7637,12 +7660,13 @@ int main(int argc, char** argv) {
         std::string line;
         std::mt19937_64 rng(1234);
         // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
-        // widest window, IK2_DRAFT_ADAPT=0 always that wide (separate controllers for greedy vs sampled requests)
-        SpecCtl sctl_greedy, sctl_sample;
+        // widest window, IK2_DRAFT_ADAPT=0 always that wide (separate controllers for greedy vs sampled, and for
+        // unguided thinking vs LoopCD-guided answering so LoopCD answering never poisons thinking's controller)
+        SpecCtl sctl_greedy, sctl_sample, sctl_greedy_think, sctl_sample_think;
         const int spec_wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 8;
         const bool spec_adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
-        sctl_greedy.wmax = sctl_sample.wmax = spec_wmax;
-        sctl_greedy.adapt = sctl_sample.adapt = spec_adapt;
+        sctl_greedy.wmax = sctl_sample.wmax = sctl_greedy_think.wmax = sctl_sample_think.wmax = spec_wmax;
+        sctl_greedy.adapt = sctl_sample.adapt = sctl_greedy_think.adapt = sctl_sample_think.adapt = spec_adapt;
         while (next_line(line)) {
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
@@ -7910,10 +7934,11 @@ int main(int argc, char** argv) {
             const RowSampler suffix_sample = temp > 0 ? RowSampler(pick) : RowSampler{};
             int suffix_at = 0;
             SuffixStats suffix_stats;
-            SpecCtl& sctl = (temp <= 0) ? sctl_greedy : sctl_sample;
-            sctl.plain_run = 0;
-            sctl.probe_cur = std::max(1, sctl.probe);
-            const uint64_t spec_acc0 = sctl.accepted, spec_dr0 = sctl.drafted;
+            for (SpecCtl* sc_p : {&sctl_greedy, &sctl_sample, &sctl_greedy_think, &sctl_sample_think}) {
+                sc_p->plain_run = 0;
+                sc_p->probe_cur = std::max(1, sc_p->probe);
+            }
+            unsigned long long req_spec_acc = 0, req_spec_off = 0;
             size_t next_placement = hist.size() + kPlacementInterval;
             for (int i = 0; i < max_new; ++i) {
                 if (g_managed_experts && hist.size() >= next_placement) {
@@ -7967,6 +7992,11 @@ int main(int argc, char** argv) {
                         continue;
                     }
                 }
+                const bool step_think =
+                    g_loopcd && g_loopcd_skip_thinking &&
+                    (tok >= kLoopCdFirstControl ? (tok == kLoopCdThinkingToken) : (g_loopcd_thinking != 0));
+                SpecCtl& sctl = (temp <= 0) ? (step_think ? sctl_greedy_think : sctl_greedy)
+                                            : (step_think ? sctl_sample_think : sctl_sample);
                 const int B = spec_on ? sctl.choose(std::min(max_new - i - 1, ctx - (int) hist.size())) : 1;
                 if (B >= 2) {
                     SampleCfg sc;
@@ -7974,7 +8004,10 @@ int main(int argc, char** argv) {
                     std::vector<int> next;
                     const double ts = now();
                     spec_step(M, drafter, tok, (int) hist.size(), B, sc, stops, next);
-                    sctl.took_spec(B, (int) next.size() - 1, now() - ts);
+                    const int step_acc = (int) next.size() - 1;
+                    sctl.took_spec(B, step_acc, now() - ts);
+                    req_spec_acc += (unsigned long long) step_acc;
+                    req_spec_off += (unsigned long long) (B - 1);
                     hist.push_back(tok);
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
                         std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
@@ -8018,14 +8051,16 @@ int main(int argc, char** argv) {
             if (suffix_stats.forwards)
                 std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
                              suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
-            if (spec_on && getenv("IK2_STATS"))
-                std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
-                             (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
-                             (unsigned long long) sctl.drafted, (unsigned long long) sctl.plain);
-            const unsigned long long req_acc =
-                (unsigned long long) suffix_stats.accepted + (unsigned long long) (sctl.accepted - spec_acc0);
-            const unsigned long long req_off =
-                (unsigned long long) suffix_stats.offered + (unsigned long long) (sctl.drafted - spec_dr0);
+            if (spec_on && getenv("IK2_STATS")) {
+                const SpecCtl& sa = (temp <= 0) ? sctl_greedy : sctl_sample;
+                const SpecCtl& st = (temp <= 0) ? sctl_greedy_think : sctl_sample_think;
+                std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens (think: %llu/%llu, %llu plain)\n",
+                             (unsigned long long) (sa.steps + st.steps), (unsigned long long) (sa.accepted + st.accepted),
+                             (unsigned long long) (sa.drafted + st.drafted), (unsigned long long) (sa.plain + st.plain),
+                             (unsigned long long) st.accepted, (unsigned long long) st.drafted, (unsigned long long) st.plain);
+            }
+            const unsigned long long req_acc = (unsigned long long) suffix_stats.accepted + req_spec_acc;
+            const unsigned long long req_off = (unsigned long long) suffix_stats.offered + req_spec_off;
             if (serve_maya)
                 std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
                             (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason,

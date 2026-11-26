@@ -79,5 +79,10 @@ size_t bytes(const Drafter* d);
 size_t context_bytes(const Drafter* d, int P);
 void save_context(Drafter* d, int P, uint8_t* out);
 void load_context(Drafter* d, int P, const uint8_t* in);
+/// Same for only the local sliding-window ring layers (+ f_rnn for DSpark): used by prompt snapshots (Snap) so
+/// multi-turn rewinds after > window generated tokens never read stale ring slots.
+size_t local_context_bytes(const Drafter* d, int P);
+void save_local_context(Drafter* d, int P, uint8_t* out);
+void load_local_context(Drafter* d, int P, const uint8_t* in);
 
 }  // namespace ik2::draft

@@ -2013,7 +2013,14 @@ size_t context_bytes(const Drafter* d, int P) {
     for (const auto& l : d->L) b += 2 * (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
     return b;
 }
-static void copy_context(Drafter* d, int P, uint8_t* host, bool save) {
+size_t local_context_bytes(const Drafter* d, int P) {
+    const size_t KD = (size_t) d->KV * 128;
+    size_t b = d->is_dflash2 ? 0 : (size_t) d->C * 4;
+    for (const auto& l : d->L)
+        if (l.local) b += 2 * (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
+    return b;
+}
+static void copy_context(Drafter* d, int P, uint8_t* host, bool save, bool local_only) {
     const size_t KD = (size_t) d->KV * 128;
     cu(cudaStreamSynchronize(d->s), "drafter park");
     constexpr size_t kStage = 16ULL << 20;
@@ -2072,14 +2079,17 @@ static void copy_context(Drafter* d, int P, uint8_t* host, bool save) {
         }
     };
     for (auto& l : d->L) {
+        if (local_only && !l.local) continue;
         const size_t n = (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
         one(l.kc16 ? (void*) l.kc16 : (void*) l.kc, n);
         one(l.kc16 ? (void*) l.vc16 : (void*) l.vc, n);
     }
     if (!d->is_dflash2) one(d->f_rnn, (size_t) d->C * 4);
 }
-void save_context(Drafter* d, int P, uint8_t* out) { copy_context(d, P, out, true); }
-void load_context(Drafter* d, int P, const uint8_t* in) { copy_context(d, P, const_cast<uint8_t*>(in), false); }
+void save_context(Drafter* d, int P, uint8_t* out) { copy_context(d, P, out, true, false); }
+void load_context(Drafter* d, int P, const uint8_t* in) { copy_context(d, P, const_cast<uint8_t*>(in), false, false); }
+void save_local_context(Drafter* d, int P, uint8_t* out) { copy_context(d, P, out, true, true); }
+void load_local_context(Drafter* d, int P, const uint8_t* in) { copy_context(d, P, const_cast<uint8_t*>(in), false, true); }
 
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
 
