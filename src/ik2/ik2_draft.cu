@@ -1096,11 +1096,60 @@ size_t context_bytes(const Drafter* d, int P) {
 static void copy_context(Drafter* d, int P, uint8_t* host, bool save) {
     const size_t KD = (size_t) d->KV * 128;
     cu(cudaStreamSynchronize(d->s), "drafter park");
+    constexpr size_t kStage = 16ULL << 20;
+    static uint8_t* stage[2] = {nullptr, nullptr};
+    static cudaEvent_t ev[2] = {nullptr, nullptr};
+    if (!stage[0]) {
+        for (int b = 0; b < 2; ++b) {
+            cu(cudaHostAlloc(&stage[b], kStage, cudaHostAllocDefault), "drafter stage");
+            cu(cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming), "drafter stage ev");
+        }
+    }
     size_t at = 0;
     auto one = [&](void* dev, size_t n) {
-        cu(save ? cudaMemcpy(host + at, dev, n, cudaMemcpyDefault) : cudaMemcpy(dev, host + at, n, cudaMemcpyDefault),
-           "drafter park");
+        if (!n) return;
+        uint8_t* dp = (uint8_t*) dev;
+        uint8_t* hp = host + at;
         at += n;
+        if (n <= (256ULL << 10)) {
+            cu(save ? cudaMemcpyAsync(stage[0], dp, n, cudaMemcpyDefault, d->s)
+                    : cudaMemcpyAsync(dp, (std::memcpy(stage[0], hp, n), stage[0]), n, cudaMemcpyDefault, d->s),
+               "drafter park small");
+            cu(cudaStreamSynchronize(d->s), "drafter park small sync");
+            if (save) std::memcpy(hp, stage[0], n);
+            return;
+        }
+        int cur = 0;
+        if (save) {
+            size_t prev_off = 0, prev_len = 0;
+            for (size_t off = 0; off < n; off += kStage) {
+                const size_t len = std::min(kStage, n - off);
+                cu(cudaMemcpyAsync(stage[cur], dp + off, len, cudaMemcpyDefault, d->s), "drafter d2h");
+                cu(cudaEventRecord(ev[cur], d->s), "drafter ev");
+                if (prev_len) {
+                    cu(cudaEventSynchronize(ev[1 - cur]), "drafter ev sync");
+                    std::memcpy(hp + prev_off, stage[1 - cur], prev_len);
+                }
+                prev_off = off, prev_len = len;
+                cur ^= 1;
+            }
+            if (prev_len) {
+                cu(cudaEventSynchronize(ev[1 - cur]), "drafter ev sync last");
+                std::memcpy(hp + prev_off, stage[1 - cur], prev_len);
+            }
+        } else {
+            bool busy[2] = {false, false};
+            for (size_t off = 0; off < n; off += kStage) {
+                const size_t len = std::min(kStage, n - off);
+                if (busy[cur]) cu(cudaEventSynchronize(ev[cur]), "drafter h2d sync");
+                std::memcpy(stage[cur], hp + off, len);
+                cu(cudaMemcpyAsync(dp + off, stage[cur], len, cudaMemcpyDefault, d->s), "drafter h2d");
+                cu(cudaEventRecord(ev[cur], d->s), "drafter h2d ev");
+                busy[cur] = true;
+                cur ^= 1;
+            }
+            cu(cudaStreamSynchronize(d->s), "drafter h2d finish");
+        }
     };
     for (auto& l : d->L) {
         const size_t n = (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);

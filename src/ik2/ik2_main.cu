@@ -7244,6 +7244,8 @@ int main(int argc, char** argv) {
             }
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
         };
+        uint64_t live_park_id = 0;
+        int live_park_clean = 0;   // global KV rows [0 .. live_park_clean) in VRAM are byte-identical to park live_park_id
         auto reset = [&]() {
             for (auto& sn : snaps) sn.pos = -1;
             for (int vis = 0; vis < (int) M.V.size(); ++vis) {
@@ -7258,6 +7260,8 @@ int main(int argc, char** argv) {
             hist_sig.clear();
             last.clear();
             g_loopcd_thinking = 0;
+            live_park_id = 0;
+            live_park_clean = 0;
         };
         // IK2_SLOT_KEEP (8; 0: off): conversations kept in host RAM.  The state above is one conversation's; a request
         // from another (an agent's side call: a summary, a sub-task, a picture's description) threw it away, and the
@@ -7266,16 +7270,46 @@ int main(int argc, char** argv) {
         // sliding windows, the drafter's context), and a request that continues a parked one gets it back in a copy
         // instead of a read.  The parked take at most half of the RAM free now over a 4 GiB reserve, counting what
         // they hold (IK2_SLOT_RAM_GB: at most that), and at most IK2_SLOT_KEEP; the least recently used is given up first.
+        struct RawBuf {
+            uint8_t* p = nullptr;
+            size_t sz = 0, cap = 0;
+            RawBuf() = default;
+            ~RawBuf() { std::free(p); }
+            RawBuf(const RawBuf&) = delete;
+            RawBuf& operator=(const RawBuf&) = delete;
+            RawBuf(RawBuf&& o) noexcept : p(o.p), sz(o.sz), cap(o.cap) { o.p = nullptr, o.sz = o.cap = 0; }
+            RawBuf& operator=(RawBuf&& o) noexcept {
+                if (this != &o) {
+                    std::free(p);
+                    p = o.p, sz = o.sz, cap = o.cap;
+                    o.p = nullptr, o.sz = o.cap = 0;
+                }
+                return *this;
+            }
+            void reserve_uninit(size_t n) {
+                if (n > cap) {
+                    uint8_t* np = (uint8_t*) std::realloc(p, n);
+                    if (!np) throw std::bad_alloc();
+                    p = np, cap = n;
+                }
+                sz = n;
+            }
+            uint8_t* data() { return p; }
+            const uint8_t* data() const { return p; }
+            size_t size() const { return sz; }
+            bool empty() const { return sz == 0; }
+        };
         struct ParkSnap {
             int pos = -1;
-            std::vector<std::vector<uint8_t>> h, kv_k, kv_v;    // conv histories [visit * 4 + conv]; sliding K / V [visit]
+            std::vector<RawBuf> h, kv_k, kv_v;                  // conv histories [visit * 4 + conv]; sliding K / V [visit]
         };
         struct Park {
+            uint64_t id = 0;
             std::vector<int> ids;                               // the tokens before its point
             std::vector<uint64_t> sig;                          // their pictures' hashes (as hist_sig: may be shorter)
-            std::vector<std::vector<uint8_t>> kv_k, kv_v;       // global-attention K / V [visit]
+            std::vector<RawBuf> kv_k, kv_v;                     // global-attention K / V [visit]
             std::vector<ParkSnap> snaps;                        // saved conv + sliding-window snapshots (<= ids.size())
-            std::vector<uint8_t> draft;                         // the drafter's context caches
+            RawBuf draft;                                       // the drafter's context caches
             size_t bytes = 0;
             uint64_t tick = 0;
         };
@@ -7285,8 +7319,59 @@ int main(int argc, char** argv) {
         const double park_cap_gib = getenv("IK2_SLOT_RAM_GB") ? std::atof(getenv("IK2_SLOT_RAM_GB")) : 0.0;
         constexpr int kParkLeast = 2048;   // a shorter conversation is read again in about a second
         constexpr int kParkGain = 1024;    // a parked one comes back when it gives a request this many more tokens
-        uint64_t park_tick = 0;
+        uint64_t park_tick = 0, park_next_id = 0;
         double park_trimmed = -1e9;   // (when the working set was last handed back: see park_live)
+        // Double-buffered pinned staging for fast PCIe DMA park/restore (avoids unpinned UVM bounce + zero-fill page faults)
+        constexpr size_t kParkStage = 16ULL << 20;
+        uint8_t* park_stage[2] = {nullptr, nullptr};
+        cudaEvent_t park_ev[2] = {nullptr, nullptr};
+        auto ensure_park_stage = [&]() {
+            if (!park_stage[0]) {
+                for (int b = 0; b < 2; ++b) {
+                    CU(cudaHostAlloc(&park_stage[b], kParkStage, cudaHostAllocDefault));
+                    CU(cudaEventCreateWithFlags(&park_ev[b], cudaEventDisableTiming));
+                }
+            }
+        };
+        auto park_d2h = [&](uint8_t* dst, const void* src, size_t n) {
+            if (!n) return;
+            ensure_park_stage();
+            const uint8_t* sp = (const uint8_t*) src;
+            int cur = 0;
+            size_t prev_off = 0, prev_len = 0;
+            for (size_t off = 0; off < n; off += kParkStage) {
+                const size_t len = std::min(kParkStage, n - off);
+                CU(cudaMemcpyAsync(park_stage[cur], sp + off, len, cudaMemcpyDefault, g_s));
+                CU(cudaEventRecord(park_ev[cur], g_s));
+                if (prev_len) {
+                    CU(cudaEventSynchronize(park_ev[1 - cur]));
+                    std::memcpy(dst + prev_off, park_stage[1 - cur], prev_len);
+                }
+                prev_off = off, prev_len = len;
+                cur ^= 1;
+            }
+            if (prev_len) {
+                CU(cudaEventSynchronize(park_ev[1 - cur]));
+                std::memcpy(dst + prev_off, park_stage[1 - cur], prev_len);
+            }
+        };
+        auto park_h2d = [&](void* dst, const uint8_t* src, size_t n) {
+            if (!n) return;
+            ensure_park_stage();
+            uint8_t* dp = (uint8_t*) dst;
+            int cur = 0;
+            bool busy_b[2] = {false, false};
+            for (size_t off = 0; off < n; off += kParkStage) {
+                const size_t len = std::min(kParkStage, n - off);
+                if (busy_b[cur]) CU(cudaEventSynchronize(park_ev[cur]));
+                std::memcpy(park_stage[cur], src + off, len);
+                CU(cudaMemcpyAsync(dp + off, park_stage[cur], len, cudaMemcpyDefault, g_s));
+                CU(cudaEventRecord(park_ev[cur], g_s));
+                busy_b[cur] = true;
+                cur ^= 1;
+            }
+            CU(cudaStreamSynchronize(g_s));
+        };
         auto ram_free_now = []() -> double {   // bytes the OS can give now (Windows: RAM and commit both), 0: unknown
 #ifdef _WIN32
             MEMORYSTATUSEX ms{};
@@ -7310,11 +7395,6 @@ int main(int argc, char** argv) {
             while (m < lim && a[m] == b[m] && (m < as.size() ? as[m] : 0) == (m < bs.size() ? bs[m] : 0)) ++m;
             return m;
         };
-        // a's tokens and pictures are where b starts
-        auto starts = [&](const std::vector<int>& a, const std::vector<uint64_t>& as, const std::vector<int>& b,
-                          const std::vector<uint64_t>& bs) {
-            return a.size() <= b.size() && match_len(a, as, b, bs) == a.size();
-        };
         auto ring = [&](int v) { return M.L[M.V[v].l].sliding && M.V[v].kv_cap < ctx; };
         auto park_live = [&](const Snap& sn_top, const Park* keep) {
             const double t0 = now(), G = 1073741824.0;
@@ -7335,13 +7415,32 @@ int main(int argc, char** argv) {
             for (const auto* s : live_snaps)
                 for (int v = 0; v < (int) M.V.size(); ++v)
                     need += (size_t) 3 * (2 * KD + 2 * C) * 4 + (ring(v) ? 2 * (size_t) std::min(s->pos, c.window) * row_b : 0);
-            // (the same conversation parked at an earlier point: this one replaces it)
-            for (size_t i = 0; i < parks.size();)
-                if (parks[i].get() != keep && starts(parks[i]->ids, parks[i]->sig, hist, hist_sig) &&
-                    parks[i]->ids.size() <= (size_t) pos)
+            // Check if we can update an existing parked slot of the same conversation in-place (delta KV copy!)
+            std::unique_ptr<Park> reuse;
+            int delta_from = 0;
+            for (size_t i = 0; i < parks.size(); ++i) {
+                if (parks[i].get() == keep) continue;
+                if (live_park_id && parks[i]->id == live_park_id && live_park_clean > 0 && live_park_clean <= pos &&
+                    parks[i]->ids.size() >= (size_t) live_park_clean &&
+                    match_len(parks[i]->ids, parks[i]->sig, hist, hist_sig) >= (size_t) live_park_clean) {
+                    reuse = std::move(parks[i]);
                     parks.erase(parks.begin() + (long) i);
-                else
+                    delta_from = live_park_clean;
+                    break;
+                }
+            }
+            // Drop any other stale parked copies of the same conversation (>= 75% shared prefix or strict prefix)
+            for (size_t i = 0; i < parks.size();) {
+                const size_t ml = match_len(parks[i]->ids, parks[i]->sig, hist, hist_sig);
+                const bool same_conv = (parks[i]->ids.size() <= (size_t) pos && ml == parks[i]->ids.size()) ||
+                                       (ml >= (size_t) kParkLeast && ml * 4 >= parks[i]->ids.size() * 3);
+                if (parks[i].get() != keep && same_conv) {
+                    if (parks[i]->id == live_park_id) live_park_id = 0, live_park_clean = 0;
+                    parks.erase(parks.begin() + (long) i);
+                } else {
                     ++i;
+                }
+            }
             size_t held = 0;
             for (auto& p : parks) held += p->bytes;
             double free_b = ram_free_now();
@@ -7355,13 +7454,14 @@ int main(int argc, char** argv) {
                 free_b = ram_free_now();
             }
 #endif
-            double room = ((double) held + free_b - 4 * G) / 2;
+            double room = ((double) held + (reuse ? (double) reuse->bytes : 0.0) + free_b - 4 * G) / 2;
             if (park_cap_gib > 0) room = std::min(room, park_cap_gib * G);
             while (!parks.empty() && ((double) (held + need) > room || parks.size() >= kParkMax)) {
                 int lru = -1;
                 for (int i = 0; i < (int) parks.size(); ++i)
                     if (parks[i].get() != keep && (lru < 0 || parks[i]->tick < parks[lru]->tick)) lru = i;
                 if (lru < 0) break;
+                if (parks[lru]->id == live_park_id) live_park_id = 0, live_park_clean = 0;
                 held -= parks[lru]->bytes;
                 parks.erase(parks.begin() + lru);
             }
@@ -7370,7 +7470,8 @@ int main(int argc, char** argv) {
                              need / G, std::max(0.0, room - held) / G);
                 return;
             }
-            auto p = std::make_unique<Park>();
+            auto p = reuse ? std::move(reuse) : std::make_unique<Park>();
+            if (!p->id) p->id = ++park_next_id;
             try {
                 p->ids.assign(hist.begin(), hist.begin() + pos);
                 p->sig.assign(hist_sig.begin(), hist_sig.begin() + (long) std::min(hist_sig.size(), (size_t) pos));
@@ -7381,10 +7482,15 @@ int main(int argc, char** argv) {
                     Layer& Ly = bind_visit(M, v);
                     use_dev(Ly.dev);
                     const size_t n = (size_t) pos * row_b;
-                    p->kv_k[v].resize(n);
-                    p->kv_v[v].resize(n);
-                    CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDefault, g_s));
-                    CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDefault, g_s));
+                    const size_t skip = (size_t) delta_from * row_b;
+                    p->kv_k[v].reserve_uninit(n);
+                    p->kv_v[v].reserve_uninit(n);
+                    if (n > skip) {
+                        const uint8_t* dk = g_kv_fp8 ? (const uint8_t*) Ly.kc8 : (const uint8_t*) Ly.kc;
+                        const uint8_t* dv = g_kv_fp8 ? (const uint8_t*) Ly.vc8 : (const uint8_t*) Ly.vc;
+                        park_d2h(p->kv_k[v].data() + skip, dk + skip, n - skip);
+                        park_d2h(p->kv_v[v].data() + skip, dv + skip, n - skip);
+                    }
                 }
                 p->snaps.resize(live_snaps.size());
                 for (size_t si = 0; si < live_snaps.size(); ++si) {
@@ -7398,19 +7504,22 @@ int main(int argc, char** argv) {
                         Layer& Ly = bind_visit(M, v);
                         use_dev(Ly.dev);
                         for (int i = 0; i < 4; ++i) {
-                            ps.h[v * 4 + i].resize(3 * cc[i] * 4);
-                            CU(cudaMemcpyAsync(ps.h[v * 4 + i].data(), s.h[v * 4 + i], 3 * cc[i] * 4, cudaMemcpyDeviceToHost, g_s));
+                            const size_t hb = 3 * cc[i] * 4;
+                            ps.h[v * 4 + i].reserve_uninit(hb);
+                            CU(cudaMemcpyAsync(ps.h[v * 4 + i].data(), s.h[v * 4 + i], hb, cudaMemcpyDeviceToHost, g_s));
                         }
                         if (ring(v)) {
                             const size_t n = (size_t) std::min(s.pos, c.window) * row_b;
-                            ps.kv_k[v].assign(s.kv_k[v].begin(), s.kv_k[v].begin() + (long) n);
-                            ps.kv_v[v].assign(s.kv_v[v].begin(), s.kv_v[v].begin() + (long) n);
+                            ps.kv_k[v].reserve_uninit(n);
+                            ps.kv_v[v].reserve_uninit(n);
+                            std::memcpy(ps.kv_k[v].data(), s.kv_k[v].data(), n);
+                            std::memcpy(ps.kv_v[v].data(), s.kv_v[v].data(), n);
                         }
                     }
                 }
                 for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
                 if (drafter) {
-                    p->draft.resize(ik2::draft::context_bytes(drafter, pos));
+                    p->draft.reserve_uninit(ik2::draft::context_bytes(drafter, pos));
                     ik2::draft::save_context(drafter, pos, p->draft.data());
                 }
             } catch (const std::bad_alloc&) {
@@ -7419,9 +7528,12 @@ int main(int argc, char** argv) {
             }
             p->bytes = need;
             p->tick = ++park_tick;
+            live_park_id = p->id;
+            live_park_clean = pos;
             parks.push_back(std::move(p));
-            std::fprintf(stderr, "ik2 slots: kept a conversation of %d tokens (%zu snaps, %.2f GiB) in %.0f ms; %zu kept, %.2f GiB\n",
-                         pos, live_snaps.size(), need / G, (now() - t0) * 1e3, parks.size(), (held + need) / G);
+            std::fprintf(stderr, "ik2 slots: kept a conversation of %d tokens (%zu snaps, %.2f GiB%s) in %.0f ms; %zu kept, %.2f GiB\n",
+                         pos, live_snaps.size(), need / G, delta_from ? ", delta" : "", (now() - t0) * 1e3,
+                         parks.size(), (held + need) / G);
         };
         auto park_restore = [&](Park& p, int snap_idx) {
             const double t0 = now();
@@ -7437,12 +7549,12 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 4; ++i)
                     CU(cudaMemcpyAsync(sn.h[v * 4 + i], ps.h[v * 4 + i].data(), 3 * cc[i] * 4, cudaMemcpyHostToDevice, g_s));
                 if (ring(v)) {
-                    std::copy(ps.kv_k[v].begin(), ps.kv_k[v].end(), sn.kv_k[v].begin());
-                    std::copy(ps.kv_v[v].begin(), ps.kv_v[v].end(), sn.kv_v[v].begin());
+                    std::memcpy(sn.kv_k[v].data(), ps.kv_k[v].data(), ps.kv_k[v].size());
+                    std::memcpy(sn.kv_v[v].data(), ps.kv_v[v].data(), ps.kv_v[v].size());
                 } else {
                     const size_t n = (size_t) pos * row_b;
-                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyDefault, g_s));
-                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyDefault, g_s));
+                    park_h2d(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n);
+                    park_h2d(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n);
                 }
             }
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
@@ -7453,6 +7565,8 @@ int main(int argc, char** argv) {
             hist_sig.assign(p.sig.begin(), p.sig.begin() + (long) std::min(p.sig.size(), (size_t) pos));
             last.clear();
             g_loopcd_thinking = loopcd_thinking_from_hist(hist);
+            live_park_id = p.id;
+            live_park_clean = pos;
             p.tick = ++park_tick;
             std::fprintf(stderr, "ik2 slots: back to a conversation of %d/%zu tokens in %.0f ms\n", pos, p.ids.size(), (now() - t0) * 1e3);
         };
@@ -7657,6 +7771,8 @@ int main(int argc, char** argv) {
                 }
             }
             const int cached = (int) L;
+            if (cached < live_park_clean) live_park_clean = cached;
+            if (live_park_clean == 0) live_park_id = 0;
             if (ids.size() >= 1024) {
                 std::fprintf(stderr, "ik2 cache: prompt=%zu hist=%zu match=%zu reused=%d\n",
                              ids.size(), hist_raw, L_raw, cached);
