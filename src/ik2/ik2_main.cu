@@ -210,7 +210,7 @@ struct Config {
     int n_layer, C, H, KV, D, E, K, F, window, d_rel, extent, extent_swa, block, n_vocab, n_rows;
     // A looped model (Inkling-2-Mini): the layers core0 .. core1 - 1 (whole blocks) run n_pass times a token, so a
     // token is n_visit layer visits (n_layer without a loop).  rank: the rank of the loop's message gates.
-    int n_visit = 0, n_pass = 1, core0 = 0, core1 = 0, rank = 0;
+    int n_visit = 0, n_ref_visit = 0, n_pass = 1, core0 = 0, core1 = 0, rank = 0;
     float eps, route_scale, qk_clip, rel_clip, alpha, n_floor, gate_cap, up_cap, logit_cap;
     std::vector<bool> sliding;   // by layer
 };
@@ -1314,6 +1314,9 @@ struct Work {
     float* lp_msg_all = nullptr;   // a token's messages of a pass, every core layer's ([n_core][4][C]): one launch a pass
     float* lp_g = nullptr;   // the message gates' scratch [3][Tm][2 rank + 2]
     float *lp_a = nullptr, *lp_f = nullptr;   // ... of a chunk's: [3][Tm][rank] and [2][Tm][C]
+    // LoopCD (IK2_LOOPCD=1): saved pass-0 stream/blocks, normal readout, reference logits, reduction scratch, thinking flags
+    float *lcd_h = nullptr, *lcd_blocks = nullptr, *lcd_out = nullptr, *lcd_logits = nullptr, *lcd_scratch = nullptr;
+    uint8_t *lcd_think_d = nullptr, *lcd_think_h = nullptr;
     float* logits_h = nullptr;   // the resident token path's logits, pinned [n_vocab]
     int *cand_d = nullptr, *cand_h = nullptr, *cand_part = nullptr;   // ... its candidates (k::cand_topk's out), scratch
     // a short prompt's experts by groups, every expert in VRAM (forward): the tables, pinned and on the device -
@@ -2239,6 +2242,68 @@ bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() in
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
                             // layers without a window only)
 int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
+// LoopCD (arXiv:2610.02185): contrast final loop pass with pass 0 via extra coda visits (IK2_LOOPCD=1)
+constexpr int kLoopCdFirstControl = 199998;
+constexpr int kLoopCdThinkingToken = 200008;
+bool g_loopcd = false;
+bool g_loopcd_skip_thinking = false;
+float g_loopcd_alpha = 0.5f;
+uint8_t g_loopcd_thinking = 0;   // whether the last processed token left us inside <|content_thinking|>
+
+inline uint8_t loopcd_thinking_from_hist(const std::vector<int>& h) {
+    for (size_t i = h.size(); i-- > 0;)
+        if (h[i] >= kLoopCdFirstControl) return h[i] == kLoopCdThinkingToken ? 1 : 0;
+    return 0;
+}
+inline float loopcd_cand_bound(const Config& c) {
+    return g_loopcd ? c.logit_cap * (1.0f + 2.0f * g_loopcd_alpha) + 10.0f : c.logit_cap;
+}
+
+void run_head_loopcd(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
+                     std::vector<float>& logits_out, std::vector<int>* argmax_out) {
+    const Config& c = M.c;
+    const int C = c.C;
+    g_pf.start();
+    if (out_mode != OutMode::kNone) {
+        k::ResStates st{};
+        for (int i = 0; i < nb; ++i) st.st[i] = W.blocks + (size_t) i * W.blk_ld * C;
+        st.st[nb] = h_in;
+        k::attn_res(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, W.tmp, g_s);
+        k::rms(W.tmp, M.out_norm, T, C, c.eps, W.xq, g_s);
+        const int t0 = all_logits ? 0 : T - 1, nt = T - t0;
+        if (out_mode == OutMode::kArgmax) argmax_out->resize(nt);
+        for (int i = 0; i < nt; i += 16) {
+            const int n = std::min(16, nt - i);
+            const size_t off = (size_t) (t0 + i) * C;
+            k::to_f16(W.lcd_out + off, (size_t) n * C, W.x16, g_s);
+            matmul(M.out_w, W.lcd_out + off, W.x16, n, W.logits, c.n_rows);
+            k::to_f16(W.xq + off, (size_t) n * C, W.x16, g_s);
+            matmul(M.out_w, W.xq + off, W.x16, n, W.lcd_logits, c.n_rows);
+            if (g_loopcd_skip_thinking)
+                CU(cudaMemcpyAsync(W.lcd_think_d, W.lcd_think_h + t0 + i, (size_t) n, cudaMemcpyHostToDevice, g_s));
+            k::loopcd_guide(W.logits, W.lcd_logits, c.n_rows, c.n_vocab, n, c.logit_cap, g_loopcd_alpha,
+                            g_loopcd_skip_thinking ? W.lcd_think_d : nullptr, g_loopcd_skip_thinking,
+                            kLoopCdFirstControl, W.lcd_scratch, g_s);
+            if (out_mode == OutMode::kArgmax) {
+                if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
+                else k::argmax_rows(W.logits, c.n_rows, n, c.n_vocab, W.argmax_d + i, g_s);
+            } else {
+                const size_t at = logits_out.size();
+                logits_out.resize(at + (size_t) n * c.n_vocab);
+                CU(cudaMemcpy2DAsync(logits_out.data() + at, (size_t) c.n_vocab * 4, W.logits, (size_t) c.n_rows * 4,
+                                     (size_t) c.n_vocab * 4, n, cudaMemcpyDeviceToHost, g_s));
+            }
+        }
+        if (out_mode == OutMode::kArgmax) {
+            CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaStreamSynchronize(g_s));
+            for (int i = 0; i < nt; ++i) (*argmax_out)[i] = W.argmax_h[i];
+        } else {
+            CU(cudaStreamSynchronize(g_s));
+        }
+    }
+    g_pf.lap(g_pf.rest);
+}
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -2361,8 +2426,26 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
     k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
     CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
-    int nb = 0, nb_pre = 0, n_bank = 0;
-    for (int vis = 0; vis < c.n_visit; ++vis) {
+    int nb = 0, nb_pre = 0, nb_fp = 0, n_bank = 0;
+    const int n_vis_total = c.n_visit + c.n_ref_visit;
+    for (int vis = 0; vis < n_vis_total; ++vis) {
+        if (g_loopcd && vis == c.n_visit) {
+            if (out_mode != OutMode::kNone || g_taps) {
+                k::ResStates st{};
+                for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+                st.st[nb] = W.h;
+                k::RmsOuts outs{};
+                outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.lcd_out;
+                k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
+                if (g_taps)
+                    CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.lcd_out, Cb,
+                                       cudaMemcpyDeviceToDevice, g_s));
+            }
+            CU(cudaMemcpyAsync(W.h, W.lcd_h, Cb, cudaMemcpyDeviceToDevice, g_s));
+            for (int i = nb_pre; i < nb_fp; ++i)
+                CU(cudaMemcpyAsync(blk(i), W.lcd_blocks + (size_t) (i - nb_pre) * C, Cb, cudaMemcpyDeviceToDevice, g_s));
+            nb = nb_fp;
+        }
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis, slot);
         // a looped core's passes (as forward()'s)
@@ -2372,6 +2455,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
             } else {
+                if (g_loopcd && M.V[vis].pass == 1) {
+                    nb_fp = nb;
+                    CU(cudaMemcpyAsync(W.lcd_h, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
+                    for (int i = nb_pre; i < nb; ++i)
+                        CU(cudaMemcpyAsync(W.lcd_blocks + (size_t) (i - nb_pre) * C, blk(i), Cb,
+                                           cudaMemcpyDeviceToDevice, g_s));
+                }
                 n_bank = 0;
                 for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
                     CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, blk(i), Cb, cudaMemcpyDeviceToDevice, g_s));
@@ -2583,18 +2673,29 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
         k::RmsOuts outs{};
         outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
-        if (g_taps)
-            CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, Cb, cudaMemcpyDeviceToDevice, g_s));
-        mv1(M.out_w, W.xq, W.logits);
+        if (g_loopcd) {
+            mv1(M.out_w, W.lcd_out, W.logits);
+            mv1(M.out_w, W.xq, W.lcd_logits);
+            if (g_loopcd_skip_thinking)
+                CU(cudaMemcpyAsync(W.lcd_think_d, W.lcd_think_h, 1, cudaMemcpyHostToDevice, g_s));
+            k::loopcd_guide(W.logits, W.lcd_logits, c.n_rows, c.n_vocab, 1, c.logit_cap, g_loopcd_alpha,
+                            g_loopcd_skip_thinking ? W.lcd_think_d : nullptr, g_loopcd_skip_thinking,
+                            kLoopCdFirstControl, W.lcd_scratch, g_s);
+        } else {
+            if (g_taps)
+                CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, Cb, cudaMemcpyDeviceToDevice, g_s));
+            mv1(M.out_w, W.xq, W.logits);
+        }
+        const float cap_hi = loopcd_cand_bound(c);
         if (out_mode == OutMode::kArgmax) {
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
         } else if (out_mode == OutMode::kCand) {   // (the softcap keeps the logits within +- logit_cap)
-            k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
-            k::cand_topk(W.logits, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap, W.cand_part, W.cand_d, g_s);
+            if (!g_loopcd) k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
+            k::cand_topk(W.logits, c.n_vocab, -cap_hi, cap_hi, kCandK, kCandCap, W.cand_part, W.cand_d, g_s);
             CU(cudaMemcpyAsync(W.cand_h, W.cand_d, (size_t) (2 + 2 * kCandCap) * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
-            k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
+            if (!g_loopcd) k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
             CU(cudaMemcpyAsync(W.logits_h, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
         }
     }
@@ -2608,6 +2709,10 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
+    if (g_loopcd && g_loopcd_skip_thinking) {
+        if (tok >= kLoopCdFirstControl) g_loopcd_thinking = (tok == kLoopCdThinkingToken) ? 1 : 0;
+        W.lcd_think_h[0] = g_loopcd_thinking;
+    }
     if (!g_graph) {
         fast_token_launches(M, W, out_mode, slot);
     } else {
@@ -2669,6 +2774,7 @@ struct BlockBufs {
     k::ConvRec* recs[kMaxParallel] = {};   // per-slot visit conv records (rollback_block)
     int n_recs = 0;
     int *cand_d = nullptr, *cand_h = nullptr;   // kCand: each row's k::cand_topk out, [kBlockMax][2 + 2 kCandCap]
+    uint8_t* lcd_think_h = nullptr;             // pinned [kBlockMax]: LoopCD thinking flags per window row
 };
 BlockBufs g_blk;
 FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode (single active slot, evicted on slot switch)
@@ -2685,6 +2791,7 @@ void block_init(Model& M) {
     g_blk.slot_ids_d = dalloc<int>(kMaxParallel);
     CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+    if (g_loopcd) CU(cudaHostAlloc(&g_blk.lcd_think_h, (size_t) kBlockMax, cudaHostAllocPortable));
     g_blk.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
     g_blk.blob = dalloc<const uint8_t*>(S);
     g_blk.n = dalloc<int>(S), g_blk.inv = dalloc<int>(S);
@@ -2727,8 +2834,26 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
     k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
     CU(cudaMemcpyAsync(W.pos, g_blk.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
-    int nb = 0, nb_pre = 0, n_bank = 0;
-    for (int vis = 0; vis < c.n_visit; ++vis) {
+    int nb = 0, nb_pre = 0, nb_fp = 0, n_bank = 0;
+    const int n_vis_total = c.n_visit + c.n_ref_visit;
+    for (int vis = 0; vis < n_vis_total; ++vis) {
+        if (g_loopcd && vis == c.n_visit) {
+            if (out_mode != OutMode::kNone || g_taps) {
+                k::ResStates st{};
+                for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+                st.st[nb] = W.h;
+                k::RmsOuts outs{};
+                outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.lcd_out;
+                k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+                if (g_taps)
+                    CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.lcd_out, TCb,
+                                       cudaMemcpyDeviceToDevice, g_s));
+            }
+            CU(cudaMemcpyAsync(W.h, W.lcd_h, TCb, cudaMemcpyDeviceToDevice, g_s));
+            for (int i = nb_pre; i < nb_fp; ++i)
+                CU(cudaMemcpyAsync(blk(i), W.lcd_blocks + (size_t) (i - nb_pre) * TC, TCb, cudaMemcpyDeviceToDevice, g_s));
+            nb = nb_fp;
+        }
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis, slot);
         const float* msg = nullptr;
@@ -2737,6 +2862,13 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
             } else {
+                if (g_loopcd && M.V[vis].pass == 1) {
+                    nb_fp = nb;
+                    CU(cudaMemcpyAsync(W.lcd_h, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+                    for (int i = nb_pre; i < nb; ++i)
+                        CU(cudaMemcpyAsync(W.lcd_blocks + (size_t) (i - nb_pre) * TC, blk(i), TCb,
+                                           cudaMemcpyDeviceToDevice, g_s));
+                }
                 n_bank = 0;
                 for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
                     CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TCb, cudaMemcpyDeviceToDevice, g_s));
@@ -2901,21 +3033,33 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
         k::RmsOuts outs{};
         outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
-        if (g_taps)
-            CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
-        tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+        if (g_loopcd) {
+            tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.lcd_logits, c.n_rows);
+            k::to_f16(W.lcd_out, TC, W.x16, g_s);
+            tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+            if (g_loopcd_skip_thinking)
+                CU(cudaMemcpyAsync(W.lcd_think_d, g_blk.lcd_think_h, (size_t) T, cudaMemcpyHostToDevice, g_s));
+            k::loopcd_guide(W.logits, W.lcd_logits, c.n_rows, c.n_vocab, T, c.logit_cap, g_loopcd_alpha,
+                            g_loopcd_skip_thinking ? W.lcd_think_d : nullptr, g_loopcd_skip_thinking,
+                            kLoopCdFirstControl, W.lcd_scratch, g_s);
+        } else {
+            if (g_taps)
+                CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
+            tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+        }
+        const float cap_hi = loopcd_cand_bound(c);
         if (out_mode == OutMode::kArgmax) {
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
         } else if (out_mode == OutMode::kCand) {   // (each row's candidates, as the token path's)
             const size_t cs = 2 + 2 * (size_t) kCandCap;
-            k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
+            if (!g_loopcd) k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
-                k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap,
+                k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -cap_hi, cap_hi, kCandK, kCandCap,
                              W.cand_part, g_blk.cand_d + t * cs, g_s);
             CU(cudaMemcpyAsync(g_blk.cand_h, g_blk.cand_d, (size_t) T * cs * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
-            k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
+            if (!g_loopcd) k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
                 CU(cudaMemcpyAsync(g_blk.logits_h + (size_t) t * c.n_vocab, W.logits + (size_t) t * c.n_rows,
                                    (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
@@ -2935,6 +3079,14 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     for (int t = 0; t < T; ++t) {
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
         g_blk.pos_h[t] = pos0 + t;
+    }
+    if (g_loopcd && g_loopcd_skip_thinking) {
+        uint8_t th = g_loopcd_thinking;
+        for (int t = 0; t < T; ++t) {
+            if (tok[t] >= kLoopCdFirstControl) th = (tok[t] == kLoopCdThinkingToken) ? 1 : 0;
+            g_blk.lcd_think_h[t] = th;
+        }
+        g_loopcd_thinking = th;
     }
     if (!g_graph) {
         fast_block_launches(M, W, T, out_mode, slot);
@@ -3383,6 +3535,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         }
     const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
     if (m < B) block_rollback(m, slot);
+    if (g_loopcd && g_loopcd_skip_thinking) g_loopcd_thinking = g_blk.lcd_think_h[m - 1];
     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
@@ -3426,8 +3579,35 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         std::fclose(f);
     };
 
-    int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
-    for (int vis = 0; vis < c.n_visit; ++vis) {
+    if (g_loopcd && g_loopcd_skip_thinking) {
+        uint8_t th = g_loopcd_thinking;
+        for (int t = 0; t < T; ++t) {
+            if (tok[t] >= kLoopCdFirstControl) th = (tok[t] == kLoopCdThinkingToken) ? 1 : 0;
+            W.lcd_think_h[t] = th;
+        }
+        g_loopcd_thinking = th;
+    }
+
+    int nb_pre = 0, nb_fp = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
+    const int n_vis_total = c.n_visit + c.n_ref_visit;
+    for (int vis = 0; vis < n_vis_total; ++vis) {
+        if (g_loopcd && vis == c.n_visit) {
+            if (out_mode != OutMode::kNone || g_taps) {
+                k::ResStates st{};
+                for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+                st.st[nb] = W.h;
+                k::attn_res(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, W.tmp, g_s);
+                k::rms(W.tmp, M.out_norm, T, C, c.eps, W.lcd_out, g_s);
+                if (g_taps)
+                    CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.lcd_out, TC * 4,
+                                       cudaMemcpyDeviceToDevice, g_s));
+            }
+            CU(cudaMemcpyAsync(W.h, W.lcd_h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+            for (int i = nb_pre; i < nb_fp; ++i)
+                CU(cudaMemcpyAsync(blk(i), W.lcd_blocks + (size_t) (i - nb_pre) * TC, TC * 4,
+                                   cudaMemcpyDeviceToDevice, g_s));
+            nb = nb_fp;
+        }
         const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
         Layer& Ly = bind_visit(M, vis, slot);
         if (Ly.dev != g_cur) {   // the next GPU's layers: the stream and the block states go along
@@ -3454,6 +3634,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
             } else {
+                if (g_loopcd && M.V[vis].pass == 1) {
+                    nb_fp = nb;
+                    CU(cudaMemcpyAsync(W.lcd_h, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                    for (int i = nb_pre; i < nb; ++i)
+                        CU(cudaMemcpyAsync(W.lcd_blocks + (size_t) (i - nb_pre) * TC, blk(i), TC * 4,
+                                           cudaMemcpyDeviceToDevice, g_s));
+                }
                 n_bank = 0;
                 for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
                     CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TC * 4, cudaMemcpyDeviceToDevice, g_s));
@@ -4001,7 +4188,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         g_pf.lap(g_pf.rest);
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
-    run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    if (g_loopcd) run_head_loopcd(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    else run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
 #undef W
 #undef EC
 }
@@ -4621,6 +4809,22 @@ int main(int argc, char** argv) {
         // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
         if (!draft_path.empty() && (c.C != 2304 || c.n_visit != 48)) die("--draft: a looped model other than Inkling-2-Mini");
     }
+    if (getenv("IK2_LOOPCD") && std::atoi(getenv("IK2_LOOPCD"))) {
+        if (c.n_pass > 1 && c.core1 < c.n_layer) {
+            if (g_parallel > 1) die("IK2_LOOPCD is not supported with --parallel > 1");
+            if (n_gpu > 1) die("IK2_LOOPCD requires --gpus 1");
+            g_loopcd = true;
+            c.n_ref_visit = c.n_layer - c.core1;
+            if (getenv("IK2_LOOPCD_ALPHA"))
+                g_loopcd_alpha = std::max(0.0f, std::strtof(getenv("IK2_LOOPCD_ALPHA"), nullptr));
+            g_loopcd_skip_thinking =
+                getenv("IK2_LOOPCD_SKIP_THINKING") && std::atoi(getenv("IK2_LOOPCD_SKIP_THINKING"));
+            std::printf("loopcd: enabled (alpha=%.3f, skip_thinking=%d, +%d coda visits)\n", g_loopcd_alpha,
+                        g_loopcd_skip_thinking ? 1 : 0, c.n_ref_visit);
+        } else {
+            std::printf("loopcd: ignored (requires a looped model with post-loop layers)\n");
+        }
+    }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
     g_tp_F = c.F, g_tp_C = c.C;
     if (n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) {
@@ -4748,8 +4952,9 @@ int main(int argc, char** argv) {
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : global_cap;
             const size_t mult = c.sliding[l] ? (size_t) g_parallel : 1;
+            const size_t lvis = (l >= c.core0 && l < c.core1) ? (size_t) c.n_pass : ((g_loopcd && l >= c.core1) ? 2 : 1);
             if (!g_kv_managed || c.sliding[l])
-                kv_b += mult * (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+                kv_b += mult * lvis * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
@@ -4773,7 +4978,8 @@ int main(int argc, char** argv) {
         size_t kv_tok = 0, kv_fixed = 0;   // (the K / V bytes a context position costs, and those that do not grow)
         for (int l = 0; l < c.n_layer; ++l) {
             if (g_kv_managed && !c.sliding[l]) continue;
-            const size_t visit = (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            const size_t lvis = (l >= c.core0 && l < c.core1) ? (size_t) c.n_pass : ((g_loopcd && l >= c.core1) ? 2 : 1);
+            const size_t visit = lvis * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
             if (c.sliding[l])
                 kv_fixed += (size_t) g_parallel * visit * (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock));
             else kv_tok += visit;
@@ -5026,10 +5232,12 @@ int main(int argc, char** argv) {
         g_kv_pt_d = dalloc<int>((size_t) g_parallel * g_kv_max_pages);
         CU(cudaMemset(g_kv_pt_d, 0, (size_t) g_parallel * g_kv_max_pages * sizeof(int)));
     }
-    M.V.resize(c.n_visit);
-    for (int v = 0; v < c.n_visit; ++v) {
+    const int n_vis_total = c.n_visit + c.n_ref_visit;
+    M.V.resize(n_vis_total);
+    for (int v = 0; v < n_vis_total; ++v) {
         Visit& Vi = M.V[v];
-        if (c.n_pass == 1 || v < c.core0) Vi.l = v;
+        if (v >= c.n_visit) Vi.l = c.core1 + (v - c.n_visit), Vi.pass = 0;
+        else if (c.n_pass == 1 || v < c.core0) Vi.l = v;
         else if (v < c.core0 + c.n_pass * n_core) Vi.l = c.core0 + (v - c.core0) % n_core, Vi.pass = (v - c.core0) / n_core;
         else Vi.l = v - (c.n_pass - 1) * n_core;
         const Layer& Ly = M.L[Vi.l];
@@ -5073,7 +5281,7 @@ int main(int argc, char** argv) {
                         c.n_pass > 1 ? " visits" : "s", g_parallel, g_kv_total_pages, k::kKvPageSize);
         else
             std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
-                        kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
+                        kv_bytes / 1073741824.0, (int) M.V.size(), c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
     size_t fr = 0, tot = 0;
@@ -5447,6 +5655,15 @@ int main(int argc, char** argv) {
         W.lp_a = work_alloc<float>(3 * Tm * (size_t)c.rank);
         W.lp_f = work_alloc<float>(2 * Tm * C);
     }
+    if (g_loopcd) {
+        W.lcd_h = work_alloc<float>(Tm * C);
+        W.lcd_blocks = work_alloc<float>((size_t) (n_core / c.block) * Tm * C);
+        W.lcd_out = work_alloc<float>(Tm * C);
+        W.lcd_logits = dalloc<float>((size_t) 16 * c.n_rows);
+        W.lcd_scratch = dalloc<float>(k::loopcd_scratch(16));
+        W.lcd_think_d = dalloc<uint8_t>(Tm);
+        CU(cudaHostAlloc(&W.lcd_think_h, Tm, cudaHostAllocPortable));
+    }
     for (auto& Vi : M.V) {   // the conv histories start at zero
         if (M.L[Vi.l].dev != d) continue;
         CU(cudaMemset(Vi.h_k, 0, (size_t) g_parallel * 3 * KD * 4));
@@ -5565,8 +5782,10 @@ int main(int argc, char** argv) {
                 }
                 size_t per = 0;   // (the K / V bytes of a context position)
                 for (int l = 0; l < c.n_layer; ++l)
-                    if (!c.sliding[l] && !g_kv_managed)
-                        per += (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+                    if (!c.sliding[l] && !g_kv_managed) {
+                        const size_t lvis = (l >= c.core0 && l < c.core1) ? (size_t) c.n_pass : ((g_loopcd && l >= c.core1) ? 2 : 1);
+                        per += lvis * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+                    }
                 const long less = per ? (long) ((short_b + ((size_t) 256 << 20)) / per + 4095) / 4096 * 4096 : 0;
                 char m[400];
                 std::snprintf(m, sizeof m, "resident path off: the expert cache holds %d of %d experts (%.2f GiB short)%s;"
@@ -6515,6 +6734,7 @@ int main(int argc, char** argv) {
             hist.clear();
             hist_sig.clear();
             last.clear();
+            g_loopcd_thinking = 0;
         };
         // IK2_SLOT_KEEP (8; 0: off): conversations kept in host RAM.  The state above is one conversation's; a request
         // from another (an agent's side call: a summary, a sub-task, a picture's description) threw it away, and the
@@ -6709,6 +6929,7 @@ int main(int argc, char** argv) {
             hist.assign(p.ids.begin(), p.ids.begin() + pos);
             hist_sig.assign(p.sig.begin(), p.sig.begin() + (long) std::min(p.sig.size(), (size_t) pos));
             last.clear();
+            g_loopcd_thinking = loopcd_thinking_from_hist(hist);
             p.tick = ++park_tick;
             std::fprintf(stderr, "ik2 slots: back to a conversation of %d/%zu tokens in %.0f ms\n", pos, p.ids.size(), (now() - t0) * 1e3);
         };
@@ -6900,6 +7121,7 @@ int main(int argc, char** argv) {
                     hist.resize(sp);
                     if (hist_sig.size() > (size_t) sp) hist_sig.resize(sp);
                     last.clear();
+                    g_loopcd_thinking = loopcd_thinking_from_hist(hist);
                     L = sp;
                 } else {
                     reset(), L = 0;
@@ -7091,6 +7313,7 @@ int main(int argc, char** argv) {
                         hist.push_back(tok);
                         if (g_cancel) {
                             if (n > 1) rollback(M, 1);
+                            g_loopcd_thinking = loopcd_thinking_from_hist(hist);
                             last.clear();
                             reason = "cancelled";
                             break;
@@ -7099,6 +7322,7 @@ int main(int argc, char** argv) {
                             std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
                             hist.push_back(next[j]);
                         }
+                        g_loopcd_thinking = loopcd_thinking_from_hist(hist);
                         std::fflush(stdout);
                         n_out += n - 1;
                         i += n - 1;
@@ -7298,6 +7522,7 @@ int main(int argc, char** argv) {
                     suffix_hist.push_back(next[j]);
                     std::printf("%d,", next[j]);
                 }
+                g_loopcd_thinking = loopcd_thinking_from_hist(suffix_hist);
                 i += n - 1;
                 best = next.back();
                 if (n < 8) suffix_at = i + 16;

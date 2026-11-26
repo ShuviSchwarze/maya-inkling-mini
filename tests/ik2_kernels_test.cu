@@ -2906,6 +2906,101 @@ void test_attn_slots() {
         cudaFree(dsw);
 }
 
+static void test_loopcd_guide() {
+    auto cpu_ref = [](const std::vector<float>& fin_in, const std::vector<float>& ref_in, int ld, int n_vocab, int rows,
+                      float cap, float alpha, const std::vector<uint8_t>& thinking, bool keep_control,
+                      int first_control) {
+        std::vector<double> out((size_t) rows * n_vocab);
+        for (int r = 0; r < rows; ++r) {
+            std::vector<double> f(n_vocab), rf(n_vocab);
+            double m1 = -1e300, m2 = -1e300;
+            for (int v = 0; v < n_vocab; ++v) {
+                double fv = fin_in[(size_t) r * ld + v], rv = ref_in[(size_t) r * ld + v];
+                if (cap > 0.0f) {
+                    fv = cap * std::tanh(fv / cap);
+                    rv = cap * std::tanh(rv / cap);
+                }
+                f[v] = fv, rf[v] = rv;
+                if (fv >= m1) m2 = m1, m1 = fv;
+                else if (fv > m2) m2 = fv;
+            }
+            double z = 0.0;
+            for (int v = 0; v < n_vocab; ++v) z += std::exp(f[v] - m1);
+            const double margin = (1.0 - (m2 > -1e290 ? std::exp(m2 - m1) : 0.0)) / z;
+            double w = alpha * (1.0 - std::clamp(margin, 0.0, 1.0));
+            if (!thinking.empty() && thinking[r]) w = 0.0;
+            std::vector<double> g(n_vocab);
+            for (int v = 0; v < n_vocab; ++v) g[v] = f[v] + w * (f[v] - rf[v]);
+            if (keep_control && first_control > 0 && first_control < n_vocab) {
+                double fm = -1e300, gm = -1e300;
+                for (int v = 0; v < first_control; ++v) fm = std::max(fm, f[v]), gm = std::max(gm, g[v]);
+                double fs = 0.0, gs = 0.0;
+                for (int v = 0; v < first_control; ++v) fs += std::exp(f[v] - fm), gs += std::exp(g[v] - gm);
+                const double delta = (fm + std::log(fs)) - (gm + std::log(gs));
+                for (int v = 0; v < first_control; ++v) out[(size_t) r * n_vocab + v] = g[v] + delta;
+                for (int v = first_control; v < n_vocab; ++v) out[(size_t) r * n_vocab + v] = f[v];
+            } else {
+                for (int v = 0; v < n_vocab; ++v) out[(size_t) r * n_vocab + v] = g[v];
+            }
+        }
+        return out;
+    };
+
+    // 1. Exact tie vs clear-winner margin test (matches oMLX #5640 test cases)
+    {
+        std::vector<float> fin = {3.0f, 3.0f, 0.0f, 4.0f, 1.0f, 0.0f};
+        std::vector<float> ref = {1.0f, 2.0f, 0.0f, 2.0f, 2.0f, 0.0f};
+        float *df = dev(fin), *dr = dev(ref), *dscr = dev_n<float>(k::loopcd_scratch(2));
+        k::loopcd_guide(df, dr, 3, 3, 2, 1000.0f, 0.5f, nullptr, false, 3, dscr, 0);
+        auto got = host(df, 6);
+        std::vector<double> want = {4.0, 3.5, 0.0, 4.11037, 0.94481, 0.0};
+        expect("loopcd_guide margin tie/clear", got, want, 1e-3);
+        cudaFree(df), cudaFree(dr), cudaFree(dscr);
+    }
+
+    // 2. Control probability preservation + thinking skip on small vocab
+    {
+        std::vector<float> fin = {3.0f, 2.0f, 2.5f, 3.0f, 2.0f, 2.5f};
+        std::vector<float> ref = {0.0f, 2.0f, 1.0f, 0.0f, 2.0f, 1.0f};
+        std::vector<uint8_t> think = {0, 1};
+        float *df = dev(fin), *dr = dev(ref), *dscr = dev_n<float>(k::loopcd_scratch(2));
+        uint8_t* dt = dev(think);
+        k::loopcd_guide(df, dr, 3, 3, 2, 1000.0f, 0.5f, dt, true, 2, dscr, 0);
+        auto got = host(df, 6);
+        auto want = cpu_ref(fin, ref, 3, 3, 2, 1000.0f, 0.5f, think, true, 2);
+        expect("loopcd_guide keep_control + thinking", got, want, 2e-5);
+        cudaFree(df), cudaFree(dr), cudaFree(dscr), cudaFree(dt);
+    }
+
+    // 3. Full Inkling 2 Mini vocab (n_vocab=200058, ld=201024, rows=5, cap=30)
+    {
+        const int rows = 5, n_vocab = 200058, ld = 201024, first_ctrl = 199998;
+        auto fin = fvec((size_t) rows * ld, 12.0f);
+        auto ref = fvec((size_t) rows * ld, 12.0f);
+        // Make row 0 near-tie, row 1 sharp peak, row 2 thinking, row 3 control-heavy, row 4 normal
+        fin[(size_t) 0 * ld + 42] = 18.0f;
+        fin[(size_t) 0 * ld + 43] = 18.0f;
+        fin[(size_t) 1 * ld + 7] = 25.0f;
+        fin[(size_t) 3 * ld + 200010] = 20.0f;
+        std::vector<uint8_t> think = {0, 0, 1, 0, 0};
+        for (int keep : {0, 1}) {
+            float *df = dev(fin), *dr = dev(ref), *dscr = dev_n<float>(k::loopcd_scratch(rows));
+            uint8_t* dt = dev(think);
+            k::loopcd_guide(df, dr, ld, n_vocab, rows, 30.0f, 0.5f, keep ? dt : nullptr, keep != 0, first_ctrl, dscr, 0);
+            auto raw_got = host(df, (size_t) rows * ld);
+            std::vector<float> got((size_t) rows * n_vocab);
+            for (int r = 0; r < rows; ++r)
+                std::memcpy(got.data() + (size_t) r * n_vocab, raw_got.data() + (size_t) r * ld,
+                            (size_t) n_vocab * sizeof(float));
+            auto want = cpu_ref(fin, ref, ld, n_vocab, rows, 30.0f, 0.5f, keep ? think : std::vector<uint8_t>{},
+                                keep != 0, first_ctrl);
+            expect(keep ? "loopcd_guide full vocab keep_control" : "loopcd_guide full vocab plain", got, want, 5e-5,
+                   1e-5);
+            cudaFree(df), cudaFree(dr), cudaFree(dscr), cudaFree(dt);
+        }
+    }
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -2940,6 +3035,7 @@ int main() {
     test_q8_verify_tile();
     test_conv_slots();
     test_attn_slots();
+    test_loopcd_guide();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

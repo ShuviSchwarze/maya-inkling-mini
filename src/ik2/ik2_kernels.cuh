@@ -144,6 +144,14 @@ void to_f16(const float* x, size_t n, uint16_t* y, cudaStream_t s);
 
 /// x = cap tanh(x / cap), n values (the head's logits).
 void softcap(float* x, size_t n, float cap, cudaStream_t s);
+/// LoopCD-Logits (arXiv:2610.02185) in place on final_logits [rows][ld] using ref_logits [rows][ld] (overwritten
+/// with softcapped ref): softcaps both, computes adaptive weight alpha * (1 - top2_prob_margin(final)), zeros weight
+/// where thinking_d && thinking_d[row], computes final + w * (final - ref), and when keep_control is true preserves
+/// control-token (>= first_control) probabilities by shifting ordinary (< first_control) logits by
+/// logsumexp(final_ord) - logsumexp(guided_ord).  scratch: loopcd_scratch(rows) floats.
+size_t loopcd_scratch(int rows);
+void loopcd_guide(float* final_logits, float* ref_logits, int ld, int n_vocab, int rows, float cap, float alpha,
+                  const uint8_t* thinking_d, bool keep_control, int first_control, float* scratch, cudaStream_t s);
 
 /// The message gates of a looped model (Inkling-2-Mini: a core layer's inputs in the core's later passes), a row a
 /// token: g = D [rms(x); rms(m)] (D [R][2 C]: x's columns first; the norms without a weight, eps),

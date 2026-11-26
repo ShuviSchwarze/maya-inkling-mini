@@ -1835,6 +1835,194 @@ __global__ void softcap_kernel(float* x, size_t n, float cap) {
     if (i < n) x[i] = cap * tanhf(x[i] / cap);
 }
 
+// LoopCD-Logits (arXiv:2610.02185): softcap final & ref, compute top-2 softmax margin + ordinary logsumexp,
+// apply adaptive contrastive guidance, and optionally preserve control-token probabilities.
+constexpr int kLoopCdBlocks = 64;
+
+struct LoopCdStats {
+    float m1, m2, s;
+    float m_ord, s_ord;
+};
+
+__device__ __forceinline__ LoopCdStats loopcd_merge(LoopCdStats a, LoopCdStats b) {
+    LoopCdStats r;
+    if (a.s == 0.0f) {
+        r.m1 = b.m1, r.m2 = b.m2, r.s = b.s;
+    } else if (b.s == 0.0f) {
+        r.m1 = a.m1, r.m2 = a.m2, r.s = a.s;
+    } else if (a.m1 >= b.m1) {
+        r.m1 = a.m1;
+        r.m2 = fmaxf(a.m2, b.m1);
+        r.s = a.s + b.s * expf(b.m1 - a.m1);
+    } else {
+        r.m1 = b.m1;
+        r.m2 = fmaxf(b.m2, a.m1);
+        r.s = b.s + a.s * expf(a.m1 - b.m1);
+    }
+    if (a.s_ord == 0.0f) {
+        r.m_ord = b.m_ord, r.s_ord = b.s_ord;
+    } else if (b.s_ord == 0.0f) {
+        r.m_ord = a.m_ord, r.s_ord = a.s_ord;
+    } else if (a.m_ord >= b.m_ord) {
+        r.m_ord = a.m_ord;
+        r.s_ord = a.s_ord + b.s_ord * expf(b.m_ord - a.m_ord);
+    } else {
+        r.m_ord = b.m_ord;
+        r.s_ord = b.s_ord + a.s_ord * expf(a.m_ord - b.m_ord);
+    }
+    return r;
+}
+
+__device__ __forceinline__ LoopCdStats loopcd_shfl_xor(LoopCdStats v, int mask) {
+    LoopCdStats o;
+    o.m1 = __shfl_xor_sync(0xffffffffu, v.m1, mask);
+    o.m2 = __shfl_xor_sync(0xffffffffu, v.m2, mask);
+    o.s = __shfl_xor_sync(0xffffffffu, v.s, mask);
+    o.m_ord = __shfl_xor_sync(0xffffffffu, v.m_ord, mask);
+    o.s_ord = __shfl_xor_sync(0xffffffffu, v.s_ord, mask);
+    return o;
+}
+
+__device__ __forceinline__ float2 loopcd_lse_merge(float2 a, float2 b) {
+    if (a.y == 0.0f) return b;
+    if (b.y == 0.0f) return a;
+    if (a.x >= b.x) return {a.x, a.y + b.y * expf(b.x - a.x)};
+    return {b.x, b.y + a.y * expf(a.x - b.x)};
+}
+
+__global__ void loopcd_pass1_kernel(float* __restrict__ fin, float* __restrict__ ref, int ld, int n_vocab, float cap,
+                                    int ord_end, float* __restrict__ part) {
+    const int row = blockIdx.y, blk = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int per = (n_vocab + kLoopCdBlocks - 1) / kLoopCdBlocks;
+    const int i0 = blk * per, i1 = min(n_vocab, i0 + per);
+    float* fr = fin + (size_t) row * ld;
+    float* rr = ref + (size_t) row * ld;
+    LoopCdStats st = {-1e38f, -1e38f, 0.0f, -1e38f, 0.0f};
+    for (int i = i0 + tid; i < i1; i += blockDim.x) {
+        float f = fr[i], r = rr[i];
+        if (cap > 0.0f) {
+            f = cap * tanhf(f / cap);
+            r = cap * tanhf(r / cap);
+        }
+        fr[i] = f;
+        rr[i] = r;
+        const bool is_ord = i < ord_end;
+        LoopCdStats el = {f, -1e38f, 1.0f, is_ord ? f : -1e38f, is_ord ? 1.0f : 0.0f};
+        st = loopcd_merge(st, el);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) st = loopcd_merge(st, loopcd_shfl_xor(st, off));
+    __shared__ LoopCdStats sh[8];
+    if (lane == 0) sh[warp] = st;
+    __syncthreads();
+    if (warp == 0) {
+        st = lane < (blockDim.x >> 5) ? sh[lane] : LoopCdStats{-1e38f, -1e38f, 0.0f, -1e38f, 0.0f};
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) st = loopcd_merge(st, loopcd_shfl_xor(st, off));
+        if (lane == 0) {
+            float* dst = part + ((size_t) row * kLoopCdBlocks + blk) * 5;
+            dst[0] = st.m1, dst[1] = st.m2, dst[2] = st.s, dst[3] = st.m_ord, dst[4] = st.s_ord;
+        }
+    }
+}
+
+__global__ void loopcd_merge1_kernel(const float* __restrict__ part, float alpha, const uint8_t* __restrict__ thinking_d,
+                                     float* __restrict__ meta) {
+    const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* src = part + ((size_t) row * kLoopCdBlocks + tid) * 5;
+    LoopCdStats st = {src[0], src[1], src[2], src[3], src[4]};
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) st = loopcd_merge(st, loopcd_shfl_xor(st, off));
+    __shared__ LoopCdStats sh[2];
+    if (lane == 0) sh[warp] = st;
+    __syncthreads();
+    if (tid == 0) {
+        st = loopcd_merge(sh[0], sh[1]);
+        const float p_margin =
+            (st.s > 0.0f) ? (1.0f - (st.m2 > -1e30f ? expf(st.m2 - st.m1) : 0.0f)) / st.s : 0.0f;
+        float w = alpha * (1.0f - fminf(fmaxf(p_margin, 0.0f), 1.0f));
+        if (thinking_d && thinking_d[row]) w = 0.0f;
+        const float final_mass = (st.s_ord > 0.0f) ? (st.m_ord + logf(st.s_ord)) : 0.0f;
+        meta[row * 2 + 0] = w;
+        meta[row * 2 + 1] = final_mass;
+    }
+}
+
+__global__ void loopcd_pass2_kernel(float* __restrict__ fin, const float* __restrict__ ref, int ld, int n_end,
+                                    const float* __restrict__ meta, bool collect_lse, float* __restrict__ part2) {
+    const int row = blockIdx.y, blk = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float w = meta[row * 2 + 0];
+    if (w == 0.0f) {
+        if (collect_lse && tid == 0) {
+            float* dst = part2 + ((size_t) row * kLoopCdBlocks + blk) * 2;
+            dst[0] = -1e38f, dst[1] = 0.0f;
+        }
+        return;
+    }
+    const int per = (n_end + kLoopCdBlocks - 1) / kLoopCdBlocks;
+    const int i0 = blk * per, i1 = min(n_end, i0 + per);
+    float* fr = fin + (size_t) row * ld;
+    const float* rr = ref + (size_t) row * ld;
+    float2 lse = {-1e38f, 0.0f};
+    for (int i = i0 + tid; i < i1; i += blockDim.x) {
+        const float f = fr[i], r = rr[i];
+        const float g = f + w * (f - r);
+        fr[i] = g;
+        if (collect_lse) lse = loopcd_lse_merge(lse, {g, 1.0f});
+    }
+    if (!collect_lse) return;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float2 o = {__shfl_xor_sync(0xffffffffu, lse.x, off), __shfl_xor_sync(0xffffffffu, lse.y, off)};
+        lse = loopcd_lse_merge(lse, o);
+    }
+    __shared__ float2 sh[8];
+    if (lane == 0) sh[warp] = lse;
+    __syncthreads();
+    if (warp == 0) {
+        lse = lane < (blockDim.x >> 5) ? sh[lane] : float2{-1e38f, 0.0f};
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            float2 o = {__shfl_xor_sync(0xffffffffu, lse.x, off), __shfl_xor_sync(0xffffffffu, lse.y, off)};
+            lse = loopcd_lse_merge(lse, o);
+        }
+        if (lane == 0) {
+            float* dst = part2 + ((size_t) row * kLoopCdBlocks + blk) * 2;
+            dst[0] = lse.x, dst[1] = lse.y;
+        }
+    }
+}
+
+__global__ void loopcd_merge2_kernel(const float* __restrict__ part2, float* __restrict__ meta) {
+    const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* src = part2 + ((size_t) row * kLoopCdBlocks + tid) * 2;
+    float2 lse = {src[0], src[1]};
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float2 o = {__shfl_xor_sync(0xffffffffu, lse.x, off), __shfl_xor_sync(0xffffffffu, lse.y, off)};
+        lse = loopcd_lse_merge(lse, o);
+    }
+    __shared__ float2 sh[2];
+    if (lane == 0) sh[warp] = lse;
+    __syncthreads();
+    if (tid == 0) {
+        lse = loopcd_lse_merge(sh[0], sh[1]);
+        const float w = meta[row * 2 + 0];
+        const float final_mass = meta[row * 2 + 1];
+        meta[row * 2 + 1] = (w == 0.0f || lse.y <= 0.0f) ? 0.0f : (final_mass - (lse.x + logf(lse.y)));
+    }
+}
+
+__global__ void loopcd_shift_kernel(float* __restrict__ fin, int ld, int n_end, const float* __restrict__ meta) {
+    const int row = blockIdx.y, blk = blockIdx.x, tid = threadIdx.x;
+    const float delta = meta[row * 2 + 1];
+    if (delta == 0.0f) return;
+    const int per = (n_end + kLoopCdBlocks - 1) / kLoopCdBlocks;
+    const int i0 = blk * per, i1 = min(n_end, i0 + per);
+    float* fr = fin + (size_t) row * ld;
+    for (int i = i0 + tid; i < i1; i += blockDim.x) fr[i] += delta;
+}
+
 // The loop's message gates, up to three (a layer's q, k and v inputs) in two launches that spread over the SMs.
 // sc [n][T][2 R + 2]: per gate and token, the two halves of each g before the norms (D's x columns . x, its m columns
 // . m), then the two sums of squares.
@@ -5728,6 +5916,29 @@ void softcap(float* x, size_t n, float cap, cudaStream_t s) {
     if (!n) return;
     softcap_kernel<<<grid(n), kBlk, 0, s>>>(x, n, cap);
     check("softcap");
+}
+size_t loopcd_scratch(int rows) { return (size_t) std::max(1, rows) * (2 + (size_t) kLoopCdBlocks * 5); }
+void loopcd_guide(float* final_logits, float* ref_logits, int ld, int n_vocab, int rows, float cap, float alpha,
+                  const uint8_t* thinking_d, bool keep_control, int first_control, float* scratch, cudaStream_t s) {
+    if (rows <= 0 || n_vocab <= 0) return;
+    const bool keep = keep_control && first_control > 0 && first_control < n_vocab;
+    const int ord_end = keep ? first_control : n_vocab;
+    float* meta = scratch;
+    float* part = scratch + (size_t) rows * 2;
+    loopcd_pass1_kernel<<<dim3(kLoopCdBlocks, (unsigned) rows), kBlk, 0, s>>>(final_logits, ref_logits, ld, n_vocab,
+                                                                              cap, ord_end, part);
+    check("loopcd_guide (pass1)");
+    loopcd_merge1_kernel<<<(unsigned) rows, kLoopCdBlocks, 0, s>>>(part, alpha, thinking_d, meta);
+    check("loopcd_guide (merge1)");
+    loopcd_pass2_kernel<<<dim3(kLoopCdBlocks, (unsigned) rows), kBlk, 0, s>>>(final_logits, ref_logits, ld, ord_end,
+                                                                              meta, keep, part);
+    check("loopcd_guide (pass2)");
+    if (keep) {
+        loopcd_merge2_kernel<<<(unsigned) rows, kLoopCdBlocks, 0, s>>>(part, meta);
+        check("loopcd_guide (merge2)");
+        loopcd_shift_kernel<<<dim3(kLoopCdBlocks, (unsigned) rows), kBlk, 0, s>>>(final_logits, ld, ord_end, meta);
+        check("loopcd_guide (shift)");
+    }
 }
 
 void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s) {
