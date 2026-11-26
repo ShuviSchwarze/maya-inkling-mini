@@ -6383,7 +6383,6 @@ int main(int argc, char** argv) {
             std::vector<uint64_t> hist_sig;
             std::vector<float> last_logits;
             std::vector<Snap> snaps;
-            int snap_next = 0;
         };
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
         const int snaps_per_slot = 4;
@@ -6934,8 +6933,19 @@ int main(int argc, char** argv) {
                         sl.hist = r.ids;
                         sl.hist_sig = r.sig;
                         sl.last_logits = lo;
-                        Snap& sn = sl.snaps[sl.snap_next];
-                        sl.snap_next = (sl.snap_next + 1) % (int) sl.snaps.size();
+                        auto& ss = sl.snaps;
+                        Snap* dst = nullptr;
+                        for (auto& s : ss)
+                            if (s.pos == (int) sl.hist.size()) { dst = &s; break; }
+                        if (!dst)
+                            for (auto& s : ss)
+                                if (s.pos < 0) { dst = &s; break; }
+                        if (!dst) {
+                            dst = &ss[0];
+                            for (auto& s : ss)
+                                if (s.pos < dst->pos) dst = &s;
+                        }
+                        Snap& sn = *dst;
                         sn.pos = (int) sl.hist.size();
                         snap_copy(r.slot, sn, true);
                         r.t1 = now();
@@ -7212,7 +7222,16 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        int snap_next = 0;
+        auto alloc_snap = [&](int target_pos) -> Snap& {
+            for (auto& s : snaps)
+                if (s.pos == target_pos) return s;
+            for (auto& s : snaps)
+                if (s.pos < 0) return s;
+            size_t oldest = 0;
+            for (size_t i = 1; i < snaps.size(); ++i)
+                if (snaps[i].pos < snaps[oldest].pos) oldest = i;
+            return snaps[oldest];
+        };
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
@@ -7560,9 +7579,11 @@ int main(int argc, char** argv) {
             const ParkSnap& ps = p.snaps[(size_t) snap_idx];
             const int pos = ps.pos;
             const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
-            for (auto& sn : snaps) sn.pos = -1;   // (they were the other conversation's)
-            Snap& sn = snaps[snap_next];
-            snap_next = (snap_next + 1) % (int) snaps.size();
+            for (auto& sn : snaps) {
+                sn.pos = -1;   // (they were the other conversation's)
+                sn.draft.clear();
+            }
+            Snap& sn = alloc_snap(pos);
             for (int v = 0; v < (int) M.V.size(); ++v) {
                 Layer& Ly = bind_visit(M, v);
                 use_dev(Ly.dev);
@@ -7830,9 +7851,9 @@ int main(int argc, char** argv) {
                                             last_c ? OutMode::kLogits : OutMode::kNone, lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
                         if (!last_c && ids.size() - (p0 + n) <= 7 * (size_t) T_pass) {
-                            Snap& sn = snaps[snap_next];
-                            snap_next = (snap_next + 1) % (int) snaps.size();
-                            sn.pos = (int) (p0 + n);
+                            const int spos = (int) (p0 + n);
+                            Snap& sn = alloc_snap(spos);
+                            sn.pos = spos;
                             snap_copy(sn, true);
                         }
                         if (serve_maya) {   // (read, total, ms, tok/s, reused)
@@ -7860,9 +7881,9 @@ int main(int argc, char** argv) {
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                         }
                         if (!last_c && ids.size() - (p0 + n) <= 7 * (size_t) chunk) {
-                            Snap& sn = snaps[snap_next];
-                            snap_next = (snap_next + 1) % (int) snaps.size();
-                            sn.pos = (int) (p0 + n);
+                            const int spos = (int) (p0 + n);
+                            Snap& sn = alloc_snap(spos);
+                            sn.pos = spos;
                             snap_copy(sn, true);
                         }
                         if (serve_maya && ids.size() - L > (size_t)chunk) {
@@ -7885,9 +7906,9 @@ int main(int argc, char** argv) {
             if (L < ids.size()) {
                 hist = ids;
                 hist_sig = sig;
-                Snap& sn = snaps[snap_next];
-                snap_next = (snap_next + 1) % (int) snaps.size();
-                sn.pos = (int) hist.size();
+                const int spos = (int) hist.size();
+                Snap& sn = alloc_snap(spos);
+                sn.pos = spos;
                 snap_copy(sn, true);
             }
             place_decode(M, (int)ids.size());
