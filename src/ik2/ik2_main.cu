@@ -6523,10 +6523,15 @@ int main(int argc, char** argv) {
         // sliding windows, the drafter's context), and a request that continues a parked one gets it back in a copy
         // instead of a read.  The parked take at most half of the RAM free now over a 4 GiB reserve, counting what
         // they hold (IK2_SLOT_RAM_GB: at most that), and at most IK2_SLOT_KEEP; the least recently used is given up first.
+        struct ParkSnap {
+            int pos = -1;
+            std::vector<std::vector<uint8_t>> h, kv_k, kv_v;    // conv histories [visit * 4 + conv]; sliding K / V [visit]
+        };
         struct Park {
             std::vector<int> ids;                               // the tokens before its point
             std::vector<uint64_t> sig;                          // their pictures' hashes (as hist_sig: may be shorter)
-            std::vector<std::vector<uint8_t>> h, kv_k, kv_v;    // conv histories [visit * 4 + conv]; K / V [visit]
+            std::vector<std::vector<uint8_t>> kv_k, kv_v;       // global-attention K / V [visit]
+            std::vector<ParkSnap> snaps;                        // saved conv + sliding-window snapshots (<= ids.size())
             std::vector<uint8_t> draft;                         // the drafter's context caches
             size_t bytes = 0;
             uint64_t tick = 0;
@@ -6555,22 +6560,38 @@ int main(int argc, char** argv) {
             return kb * 1024;
 #endif
         };
+        // longest matching prefix of (a, as) and (b, bs)
+        auto match_len = [](const std::vector<int>& a, const std::vector<uint64_t>& as, const std::vector<int>& b,
+                            const std::vector<uint64_t>& bs) -> size_t {
+            size_t m = 0, lim = std::min(a.size(), b.size());
+            while (m < lim && a[m] == b[m] && (m < as.size() ? as[m] : 0) == (m < bs.size() ? bs[m] : 0)) ++m;
+            return m;
+        };
         // a's tokens and pictures are where b starts
-        auto starts = [](const std::vector<int>& a, const std::vector<uint64_t>& as, const std::vector<int>& b,
-                         const std::vector<uint64_t>& bs) {
-            if (a.size() > b.size()) return false;
-            for (size_t i = 0; i < a.size(); ++i)
-                if (a[i] != b[i] || (i < as.size() ? as[i] : 0) != (i < bs.size() ? bs[i] : 0)) return false;
-            return true;
+        auto starts = [&](const std::vector<int>& a, const std::vector<uint64_t>& as, const std::vector<int>& b,
+                          const std::vector<uint64_t>& bs) {
+            return a.size() <= b.size() && match_len(a, as, b, bs) == a.size();
         };
         auto ring = [&](int v) { return M.L[M.V[v].l].sliding && M.V[v].kv_cap < ctx; };
-        auto park_live = [&](const Snap& sn, const Park* keep) {
+        auto park_live = [&](const Snap& sn_top, const Park* keep) {
             const double t0 = now(), G = 1073741824.0;
-            const int pos = sn.pos;
+            const int pos = sn_top.pos;
             const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
+            // collect distinct valid snapshots <= pos so trailing mutable suffixes can still rewind on restore
+            std::vector<const Snap*> live_snaps;
+            for (const auto& s : snaps) {
+                if (s.pos <= 0 || s.pos > pos) continue;
+                bool dup = false;
+                for (const auto* e : live_snaps) if (e->pos == s.pos) { dup = true; break; }
+                if (!dup) live_snaps.push_back(&s);
+            }
+            if (live_snaps.empty()) live_snaps.push_back(&sn_top);
             size_t need = drafter ? ik2::draft::context_bytes(drafter, pos) : 0;
             for (int v = 0; v < (int) M.V.size(); ++v)
-                need += (size_t) 3 * (2 * KD + 2 * C) * 4 + 2 * (size_t) (ring(v) ? std::min(pos, c.window) : pos) * row_b;
+                if (!ring(v)) need += 2 * (size_t) pos * row_b;
+            for (const auto* s : live_snaps)
+                for (int v = 0; v < (int) M.V.size(); ++v)
+                    need += (size_t) 3 * (2 * KD + 2 * C) * 4 + (ring(v) ? 2 * (size_t) std::min(s->pos, c.window) * row_b : 0);
             // (the same conversation parked at an earlier point: this one replaces it)
             for (size_t i = 0; i < parks.size();)
                 if (parks[i].get() != keep && starts(parks[i]->ids, parks[i]->sig, hist, hist_sig) &&
@@ -6610,26 +6631,38 @@ int main(int argc, char** argv) {
             try {
                 p->ids.assign(hist.begin(), hist.begin() + pos);
                 p->sig.assign(hist_sig.begin(), hist_sig.begin() + (long) std::min(hist_sig.size(), (size_t) pos));
-                p->h.resize(M.V.size() * 4);
                 p->kv_k.resize(M.V.size());
                 p->kv_v.resize(M.V.size());
                 for (int v = 0; v < (int) M.V.size(); ++v) {
+                    if (ring(v)) continue;
                     Layer& Ly = bind_visit(M, v);
                     use_dev(Ly.dev);
-                    for (int i = 0; i < 4; ++i) {
-                        p->h[v * 4 + i].resize(3 * cc[i] * 4);
-                        CU(cudaMemcpyAsync(p->h[v * 4 + i].data(), sn.h[v * 4 + i], 3 * cc[i] * 4, cudaMemcpyDeviceToHost, g_s));
-                    }
-                    if (ring(v)) {   // (the snapshot's window, in host RAM already)
-                        const size_t n = (size_t) std::min(pos, c.window) * row_b;
-                        p->kv_k[v].assign(sn.kv_k[v].begin(), sn.kv_k[v].begin() + (long) n);
-                        p->kv_v[v].assign(sn.kv_v[v].begin(), sn.kv_v[v].begin() + (long) n);
-                    } else {         // (the rows of positions 0 .. pos - 1)
-                        const size_t n = (size_t) pos * row_b;
-                        p->kv_k[v].resize(n);
-                        p->kv_v[v].resize(n);
-                        CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDefault, g_s));
-                        CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDefault, g_s));
+                    const size_t n = (size_t) pos * row_b;
+                    p->kv_k[v].resize(n);
+                    p->kv_v[v].resize(n);
+                    CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDefault, g_s));
+                    CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDefault, g_s));
+                }
+                p->snaps.resize(live_snaps.size());
+                for (size_t si = 0; si < live_snaps.size(); ++si) {
+                    const Snap& s = *live_snaps[si];
+                    ParkSnap& ps = p->snaps[si];
+                    ps.pos = s.pos;
+                    ps.h.resize(M.V.size() * 4);
+                    ps.kv_k.resize(M.V.size());
+                    ps.kv_v.resize(M.V.size());
+                    for (int v = 0; v < (int) M.V.size(); ++v) {
+                        Layer& Ly = bind_visit(M, v);
+                        use_dev(Ly.dev);
+                        for (int i = 0; i < 4; ++i) {
+                            ps.h[v * 4 + i].resize(3 * cc[i] * 4);
+                            CU(cudaMemcpyAsync(ps.h[v * 4 + i].data(), s.h[v * 4 + i], 3 * cc[i] * 4, cudaMemcpyDeviceToHost, g_s));
+                        }
+                        if (ring(v)) {
+                            const size_t n = (size_t) std::min(s.pos, c.window) * row_b;
+                            ps.kv_k[v].assign(s.kv_k[v].begin(), s.kv_k[v].begin() + (long) n);
+                            ps.kv_v[v].assign(s.kv_v[v].begin(), s.kv_v[v].begin() + (long) n);
+                        }
                     }
                 }
                 for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
@@ -6644,12 +6677,13 @@ int main(int argc, char** argv) {
             p->bytes = need;
             p->tick = ++park_tick;
             parks.push_back(std::move(p));
-            std::fprintf(stderr, "ik2 slots: kept a conversation of %d tokens (%.2f GiB) in %.0f ms; %zu kept, %.2f GiB\n",
-                         pos, need / G, (now() - t0) * 1e3, parks.size(), (held + need) / G);
+            std::fprintf(stderr, "ik2 slots: kept a conversation of %d tokens (%zu snaps, %.2f GiB) in %.0f ms; %zu kept, %.2f GiB\n",
+                         pos, live_snaps.size(), need / G, (now() - t0) * 1e3, parks.size(), (held + need) / G);
         };
-        auto park_restore = [&](Park& p) {
+        auto park_restore = [&](Park& p, int snap_idx) {
             const double t0 = now();
-            const int pos = (int) p.ids.size();
+            const ParkSnap& ps = p.snaps[(size_t) snap_idx];
+            const int pos = ps.pos;
             const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
             for (auto& sn : snaps) sn.pos = -1;   // (they were the other conversation's)
             Snap& sn = snaps[snap_next];
@@ -6658,10 +6692,10 @@ int main(int argc, char** argv) {
                 Layer& Ly = bind_visit(M, v);
                 use_dev(Ly.dev);
                 for (int i = 0; i < 4; ++i)
-                    CU(cudaMemcpyAsync(sn.h[v * 4 + i], p.h[v * 4 + i].data(), 3 * cc[i] * 4, cudaMemcpyHostToDevice, g_s));
+                    CU(cudaMemcpyAsync(sn.h[v * 4 + i], ps.h[v * 4 + i].data(), 3 * cc[i] * 4, cudaMemcpyHostToDevice, g_s));
                 if (ring(v)) {
-                    std::copy(p.kv_k[v].begin(), p.kv_k[v].end(), sn.kv_k[v].begin());
-                    std::copy(p.kv_v[v].begin(), p.kv_v[v].end(), sn.kv_v[v].begin());
+                    std::copy(ps.kv_k[v].begin(), ps.kv_k[v].end(), sn.kv_k[v].begin());
+                    std::copy(ps.kv_v[v].begin(), ps.kv_v[v].end(), sn.kv_v[v].begin());
                 } else {
                     const size_t n = (size_t) pos * row_b;
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyDefault, g_s));
@@ -6671,12 +6705,12 @@ int main(int argc, char** argv) {
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
             sn.pos = pos;
             snap_copy(sn, false);   // (the conv histories and sliding windows into the visits; the snapshot stays)
-            if (drafter && !p.draft.empty()) ik2::draft::load_context(drafter, pos, p.draft.data());
-            hist = p.ids;
-            hist_sig = p.sig;
+            if (drafter && !p.draft.empty()) ik2::draft::load_context(drafter, (int) p.ids.size(), p.draft.data());
+            hist.assign(p.ids.begin(), p.ids.begin() + pos);
+            hist_sig.assign(p.sig.begin(), p.sig.begin() + (long) std::min(p.sig.size(), (size_t) pos));
             last.clear();
             p.tick = ++park_tick;
-            std::fprintf(stderr, "ik2 slots: back to a conversation of %d tokens in %.0f ms\n", pos, (now() - t0) * 1e3);
+            std::fprintf(stderr, "ik2 slots: back to a conversation of %d/%zu tokens in %.0f ms\n", pos, p.ids.size(), (now() - t0) * 1e3);
         };
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
@@ -6828,15 +6862,23 @@ int main(int argc, char** argv) {
                 int top = -1;   // the held conversation's latest snapshot: what parking it keeps
                 for (int i = 0; i < (int) snaps.size(); ++i)
                     if (snaps[i].pos >= 0 && (top < 0 || snaps[i].pos > snaps[top].pos)) top = i;
-                Park* back = nullptr;   // the parked conversation this request goes on from the furthest
-                for (auto& p : parks)
-                    if (p->ids.size() < ids.size() && (int) p->ids.size() > live + kParkGain &&
-                        (!back || p->ids.size() > back->ids.size()) && starts(p->ids, p->sig, ids, sig))
-                        back = p.get();
+                Park* back = nullptr;   // the parked conversation + snapshot this request goes on from the furthest
+                int back_snap = -1, back_pos = live + kParkGain;
+                for (auto& p : parks) {
+                    const size_t ml = match_len(p->ids, p->sig, ids, sig);
+                    for (int si = 0; si < (int) p->snaps.size(); ++si) {
+                        const int sp = p->snaps[(size_t) si].pos;
+                        if (sp > back_pos && sp <= (int) ml && sp < (int) ids.size()) {
+                            back = p.get();
+                            back_snap = si;
+                            back_pos = sp;
+                        }
+                    }
+                }
                 if (top >= 0 && snaps[top].pos >= kParkLeast && snaps[top].pos > live + kParkGain)
                     park_live(snaps[top], back);
                 if (back) {
-                    park_restore(*back);
+                    park_restore(*back, back_snap);
                     L = hist.size();
                 }
             }
