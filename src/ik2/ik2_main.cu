@@ -5486,18 +5486,7 @@ int main(int argc, char** argv) {
         // global layer's FP16 K / V for IK2_DRAFT_CTX positions (default the context), its windowed layers' F32 rings
         // and its work buffers - left out, a context that fit without it pushed experts out of VRAM with it
         size_t draft_b = 0, draft_tok = 0;
-        if (!draft_path.empty()) {
-            if (FILE* df = std::fopen(draft_path.c_str(), "rb")) {
-                std::fseek(df, 0, SEEK_END);
-                draft_b = (size_t) std::max<long>(0, std::ftell(df));
-                std::fclose(df);
-            }
-            const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : 0;
-            const size_t per = (size_t) c.KV * c.D * 2 * 2;   // (a position of the global layer: K and V in FP16)
-            if (want > 0) draft_b += (size_t) std::min(ctx, std::max(want, 2048)) * per;
-            else draft_tok = per;                             // (the whole context: grows with it)
-            draft_b += (size_t) 2 * std::min(ctx, 2048) * c.KV * c.D * 8 + ((size_t) 256 << 20);
-        }
+        if (!draft_path.empty()) ik2::draft::vram_estimate(draft_path, c.KV, c.D, ctx, draft_b, draft_tok);
         size_t kv_tok = 0, kv_fixed = 0;   // (the K / V bytes a context position costs, and those that do not grow)
         for (int l = 0; l < c.n_layer; ++l) {
             if (g_kv_managed && !c.sliding[l]) continue;
@@ -6003,25 +5992,39 @@ int main(int argc, char** argv) {
     uint16_t* draft_head = M.out_w.f16;
     if (!draft_path.empty()) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
-        if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
-            const size_t n = (size_t) c.n_rows * c.C;
-            draft_head = dalloc<uint16_t>(n);
-            k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
-        }
-        if (!draft_head) die("--draft: the output head is neither FP16 nor planar Q8_0");
+        if (!draft_head && !M.out_w.q8) die("--draft: the output head is neither FP16 nor planar Q8_0");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         const double t0 = now();
         try {
             drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
+            if (!ik2::draft::is_dflash2(drafter) && !draft_head && M.out_w.q8) {
+                // DSpark fold needs an FP16 copy of the planar Q8_0 head once, then frees it.
+                const size_t n = (size_t) c.n_rows * c.C;
+                draft_head = dalloc<uint16_t>(n);
+                k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
+            }
+            if (M.out_w.q8 && !M.out_w.f16) ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
             ik2::draft::fold(drafter, draft_head, c.n_rows);
         } catch (const std::exception& e) {
             die(e.what());
         }
-        if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
-            ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
+        if (draft_head && draft_head != M.out_w.f16) {
             CU(cudaStreamSynchronize(g_s));
             CU(cudaFree(draft_head));
             draft_head = nullptr;
+        }
+        if (const int mt = ik2::draft::mask_token_id(drafter); mt >= 0) {
+            if (mt >= c.n_rows) die("--draft: mask_token_id exceeds target embedding table");
+            std::vector<float> me((size_t) c.C);
+            const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+            k::decode_host(M.embd_type, M.embd + (size_t) mt * rb, c.C, me.data());
+            float *mraw = dalloc<float>(c.C), *mh = dalloc<float>(c.C);
+            CU(cudaMemcpyAsync(mraw, me.data(), (size_t) c.C * 4, cudaMemcpyHostToDevice, g_s));
+            k::rms(mraw, M.embd_norm, 1, c.C, c.eps, mh, g_s);
+            ik2::draft::set_mask_embed(drafter, mh);
+            CU(cudaStreamSynchronize(g_s));
+            CU(cudaFree(mraw));
+            CU(cudaFree(mh));
         }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
         g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
@@ -6032,7 +6035,8 @@ int main(int argc, char** argv) {
                 Vi.rec_x[i] = dalloc<float>((size_t) ik2::draft::kBlock * cc[i]);
             }
         }
-        std::printf("drafter: %s, %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
+        std::printf("drafter: %s (%s), %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
+                    ik2::draft::is_dflash2(drafter) ? "DFlash2" : "DSpark",
                     ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
 

@@ -130,25 +130,116 @@ std::vector<uint16_t> st_bf16(const StFile& f, const std::string& name, const st
     return v;
 }
 
+std::string read_text_file(const std::string& path) {
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return {};
+    std::fseek(fp, 0, SEEK_END);
+    const long sz = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > (1 << 20)) {
+        std::fclose(fp);
+        return {};
+    }
+    std::string s((size_t) sz, '\0');
+    const size_t got = std::fread(&s[0], 1, (size_t) sz, fp);
+    std::fclose(fp);
+    s.resize(got);
+    return s;
+}
+
+std::string sibling_config_json(const std::string& model_path) {
+    const size_t slash = model_path.find_last_of("/\\");
+    const std::string dir = (slash == std::string::npos) ? "." : model_path.substr(0, slash);
+    std::string s = read_text_file(dir + "/config.json");
+    if (s.empty()) s = read_text_file(model_path + ".config.json");
+    return s;
+}
+
+bool json_find_val(const std::string& s, const char* key, size_t& pos) {
+    const std::string pat = std::string("\"") + key + "\"";
+    size_t i = s.find(pat);
+    if (i == std::string::npos) return false;
+    i = s.find(':', i + pat.size());
+    if (i == std::string::npos) return false;
+    ++i;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+    if (i >= s.size()) return false;
+    pos = i;
+    return true;
+}
+
+int cfg_int(const std::string& s, const char* key, int def) {
+    size_t i = 0;
+    if (!json_find_val(s, key, i)) return def;
+    char* end = nullptr;
+    const long v = std::strtol(s.c_str() + i, &end, 10);
+    return end > s.c_str() + i ? (int) v : def;
+}
+
+float cfg_float(const std::string& s, const char* key, float def) {
+    size_t i = 0;
+    if (!json_find_val(s, key, i)) return def;
+    char* end = nullptr;
+    const float v = std::strtof(s.c_str() + i, &end);
+    return end > s.c_str() + i ? v : def;
+}
+
+std::string cfg_str(const std::string& s, const char* key, const std::string& def) {
+    size_t i = 0;
+    if (!json_find_val(s, key, i) || s[i] != '"') return def;
+    const size_t j = s.find('"', i + 1);
+    return j == std::string::npos ? def : s.substr(i + 1, j - i - 1);
+}
+
+constexpr int kDflashTopKMax = 64;
+constexpr int kDflashTopKSlices = 64;
+constexpr int kDflashAttnQ = 32;
+constexpr int kDflashAttnKeys = 16;
+constexpr int kDflashAttnSplits = 16;
+constexpr int kDflashAttnPart = 128 + 2;
+
+struct DflashSelMeta {
+    int P = 0;
+    int anchor = 0;
+    float inv_temp = 0.0f;
+    float u[kBlock - 1] = {};
+};
+
+struct DflashOutHost {
+    int tok[kBlock - 1] = {};
+    int cand_id[(kBlock - 1) * kDflashTopKMax] = {};
+    float q[(kBlock - 1) * kDflashTopKMax] = {};
+    float q_tok[kBlock - 1] = {};
+};
+
 }  // namespace
 
 struct DLayer {
     bool local = false;
-    float *in_norm, *post_norm, *dflare, *q_norm, *k_norm, *k_norm_ctx;
-    uint16_t *wqkv, *wo, *wkvc, *wgu, *wd;   // BF16 [out][in] (wqkv = [q; k; v], wkvc = [kc; vc])
+    float *in_norm = nullptr, *post_norm = nullptr, *dflare = nullptr;
+    float *q_norm = nullptr, *k_norm = nullptr, *k_norm_ctx = nullptr;
+    float *attn_conv_base = nullptr, *mlp_conv_base = nullptr;
+    uint16_t *wqkv = nullptr, *wo = nullptr, *wkvc = nullptr, *wgu = nullptr, *wd = nullptr;   // BF16 [out][in]
+    uint16_t *attn_conv_w = nullptr, *mlp_conv_w = nullptr;                                   // DFlash2 BF16 [cdyn][C]
     float *kc = nullptr, *vc = nullptr;                    // the context caches, F32 [cap][KV * 128] (a window's
     uint16_t *kc16 = nullptr, *vc16 = nullptr;             //  layer) or FP16 (the layer that sees the whole context)
     int cap = 0;                                           // their rows: a ring of the last cap positions
 };
 
 struct Drafter {
+    bool is_dflash2 = false;
     int taps = 8, C = 4608, H = 48, KV = 8, F = 18432, R = 256, V = 0, ctx = 0;
     int cap = 0;   // the rows of the layer without a window's context cache (IK2_DRAFT_CTX, default the context)
+    int mask_tok = -1, window = 1024, conv_taps = 0, conv_group = 16, cdyn = 0, top_k = 16;
+    float softcap = 30.0f;
+    bool post_softcap = true;
     float* ctx_tmp = nullptr;   // write_context's fused [kMixRows][2 * KV * 128]
     float eps = 1e-6f, theta = 1e6f;
     std::vector<DLayer> L;
-    float *alpha, *norm, *mask, *mk_dflare, *rnn_b;
-    uint16_t *w1, *rnn_w;
+    float *alpha = nullptr, *norm = nullptr, *mask = nullptr, *mk_dflare = nullptr, *rnn_b = nullptr;
+    float *hidden_norm = nullptr;
+    uint16_t *w1 = nullptr, *rnn_w = nullptr;
+    uint16_t *fc_w = nullptr, *sel_hidden = nullptr, *sel_prev = nullptr, *sel_next = nullptr;
     std::vector<uint16_t> hout_w, hout_b;   // host BF16, for the fold
     uint16_t *fold_w = nullptr, *fold_b = nullptr;   // FP16 [R][fold_ld], [fold_ld]
     int n_rows = 0, fold_ld = 0;
@@ -156,17 +247,23 @@ struct Drafter {
     const uint16_t* head_q8d = nullptr;
     int* shortlist = nullptr;
     float* shortlist_scores = nullptr;
-    cublasHandle_t blas;
-    cudaStream_t s;
+    cublasHandle_t blas = nullptr;
+    cudaStream_t s = nullptr;
     size_t vram = 0;
     // work
-    float *x, *res, *h, *qkv, *q, *kk, *vv, *o, *gu, *f_rnn, *base, *state, *latent, *proj, *scratch, *mix;
-    uint16_t *hb, *hb2, *rnn_in;
-    __half* x16;
-    int *pos, *ctx_pos, *toks;
+    float *x = nullptr, *res = nullptr, *h = nullptr, *qkv = nullptr, *q = nullptr, *kk = nullptr, *vv = nullptr;
+    float *o = nullptr, *gu = nullptr, *f_rnn = nullptr, *base = nullptr, *state = nullptr, *latent = nullptr;
+    float *proj = nullptr, *scratch = nullptr, *mix = nullptr;
+    float *cbuf = nullptr, *attn_part = nullptr, *sel_g = nullptr, *part_lg = nullptr, *sel_lg = nullptr;
+    int *part_id = nullptr, *sel_id = nullptr;
+    uint16_t *hb = nullptr, *hb2 = nullptr, *rnn_in = nullptr, *fc_in = nullptr;
+    __half* x16 = nullptr;
+    int *pos = nullptr, *ctx_pos = nullptr, *toks = nullptr;
     int* h_out = nullptr;   // pinned host [kBlock - 1]
     int *meta_h = nullptr, *meta_d = nullptr;   // [2]: {P, anchor} for graphed propose
     int *ctx_meta_h = nullptr, *ctx_meta_d = nullptr;   // [1]: {pos0} for graphed commit_context
+    DflashSelMeta *df_meta_h = nullptr, *df_meta_d = nullptr;
+    DflashOutHost *df_out_h = nullptr, *df_out_d = nullptr;
     bool blas_warmed = false, ctx_warmed = false;
     const float* graph_anchor = nullptr;
     const uint16_t* graph_lm = nullptr;
@@ -485,6 +582,481 @@ __global__ void shortlist_gemv(const int* ids, int n, const uint16_t* W, const f
 }
 __global__ void shortlist_pick(int* out, const int* ids) { *out = ids[*out]; }
 
+// ---- DFlash 2 kernels (grouped 2-tap dynamic conv, sliding ring split-attention, top-k, candidate selector walk)
+
+__device__ __forceinline__ float df_bf2f(uint16_t b) { return __uint_as_float((uint32_t) b << 16); }
+__device__ __forceinline__ uint16_t df_f2bf_rn(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
+
+__global__ void dflash_cat_taps_bf16_kernel(const float* __restrict__ taps, int n_tap, size_t tap_stride, int C,
+                                            uint16_t* __restrict__ out) {
+    const int row = blockIdx.y, k = blockIdx.x, tid = threadIdx.x;
+    const float* src = taps + (size_t) k * tap_stride + (size_t) row * C;
+    uint16_t* dst = out + (size_t) row * (size_t) n_tap * C + (size_t) k * C;
+    const int n4 = C >> 2;
+    const float4* s4 = (const float4*) src;
+    uint2* d4 = (uint2*) dst;
+    for (int i = tid; i < n4; i += blockDim.x) {
+        const float4 v = __ldg(s4 + i);
+        const uint16_t b0 = df_f2bf_rn(v.x), b1 = df_f2bf_rn(v.y), b2 = df_f2bf_rn(v.z), b3 = df_f2bf_rn(v.w);
+        d4[i] = make_uint2((uint32_t) b0 | ((uint32_t) b1 << 16), (uint32_t) b2 | ((uint32_t) b3 << 16));
+    }
+}
+
+__global__ void dflash_rms_bf16_kernel(const float* __restrict__ x, const float* __restrict__ w, int C, float eps,
+                                       uint16_t* __restrict__ out) {
+    __shared__ float sh[8];
+    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* xr = x + (size_t) t * C;
+    uint16_t* orow = out + (size_t) t * C;
+    const int n4 = C >> 2;
+    const float4* x4 = (const float4*) xr;
+    float a = 0.0f;
+    for (int i = tid; i < n4; i += 256) {
+        const float4 v = __ldg(x4 + i);
+        a += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if (lane == 0) sh[warp] = a;
+    __syncthreads();
+    if (warp == 0) {
+        float s = lane < 8 ? sh[lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (lane == 0) sh[0] = rsqrtf(s / (float) C + eps);
+    }
+    __syncthreads();
+    const float rs = sh[0];
+    const float4* w4 = (const float4*) w;
+    uint2* o4 = (uint2*) orow;
+    for (int i = tid; i < n4; i += 256) {
+        const float4 v = __ldg(x4 + i), ww = __ldg(w4 + i);
+        const uint16_t b0 = df_f2bf_rn(v.x * rs * ww.x), b1 = df_f2bf_rn(v.y * rs * ww.y);
+        const uint16_t b2 = df_f2bf_rn(v.z * rs * ww.z), b3 = df_f2bf_rn(v.w * rs * ww.w);
+        o4[i] = make_uint2((uint32_t) b0 | ((uint32_t) b1 << 16), (uint32_t) b2 | ((uint32_t) b3 << 16));
+    }
+}
+
+__global__ void dflash_rms_f32_bf16_kernel(const float* __restrict__ res, const float* __restrict__ w, int C, float eps,
+                                           float* __restrict__ y32, uint16_t* __restrict__ ybf) {
+    __shared__ float sh[8];
+    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* rr = res + (size_t) t * C;
+    float* o32 = y32 + (size_t) t * C;
+    uint16_t* obf = ybf + (size_t) t * C;
+    const int n4 = C >> 2;
+    const float4* r4 = (const float4*) rr;
+    float a = 0.0f;
+    for (int i = tid; i < n4; i += 256) {
+        const float4 v = __ldg(r4 + i);
+        a += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if (lane == 0) sh[warp] = a;
+    __syncthreads();
+    if (warp == 0) {
+        float s = lane < 8 ? sh[lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (lane == 0) sh[0] = rsqrtf(s / (float) C + eps);
+    }
+    __syncthreads();
+    const float rs = sh[0];
+    const float4* w4 = (const float4*) w;
+    float4* o32_4 = (float4*) o32;
+    uint2* obf_4 = (uint2*) obf;
+    for (int i = tid; i < n4; i += 256) {
+        const float4 v = __ldg(r4 + i), ww = __ldg(w4 + i);
+        const float r0 = v.x * rs * ww.x, r1 = v.y * rs * ww.y, r2 = v.z * rs * ww.z, r3 = v.w * rs * ww.w;
+        o32_4[i] = make_float4(r0, r1, r2, r3);
+        const uint16_t b0 = df_f2bf_rn(r0), b1 = df_f2bf_rn(r1), b2 = df_f2bf_rn(r2), b3 = df_f2bf_rn(r3);
+        obf_4[i] = make_uint2((uint32_t) b0 | ((uint32_t) b1 << 16), (uint32_t) b2 | ((uint32_t) b3 << 16));
+    }
+}
+
+__global__ void dflash_conv_side0_bf16_kernel(const float* __restrict__ x, const float* __restrict__ c, int ldc,
+                                              const float* __restrict__ base, int E, int taps, int group,
+                                              uint16_t* __restrict__ out_bf) {
+    const int t = blockIdx.x, ng = E / group;
+    const float* ct = c + (size_t) t * ldc;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        const int g = e / group;
+        float acc = 0.0f;
+        for (int tap = 0; tap < taps && tap <= t; ++tap)
+            acc = fmaf(ct[tap * ng + g] + base[(size_t) tap * E + e], x[(size_t) (t - tap) * E + e], acc);
+        out_bf[(size_t) t * E + e] = df_f2bf_rn(acc);
+    }
+}
+
+__global__ void dflash_conv_side1_add_kernel(const float* __restrict__ x, const float* __restrict__ c, int ldc,
+                                             const float* __restrict__ base, int E, int taps, int group,
+                                             float* __restrict__ res) {
+    const int t = blockIdx.x, ng = E / group;
+    const float* ct = c + (size_t) t * ldc + (size_t) taps * ng;
+    const float* bs = base + (size_t) taps * E;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        const int g = e / group;
+        float acc = 0.0f;
+        for (int tap = 0; tap < taps && tap <= t; ++tap)
+            acc = fmaf(ct[tap * ng + g] + bs[(size_t) tap * E + e], x[(size_t) (t - tap) * E + e], acc);
+        res[(size_t) t * E + e] += acc;
+    }
+}
+
+__global__ void dflash_final_rms_f16_bf16_kernel(const float* __restrict__ res, const float* __restrict__ w, int C,
+                                                 float eps, __half* __restrict__ x16, uint16_t* __restrict__ xbf) {
+    __shared__ float sh[8];
+    // blockIdx.x in [0, proposals) reads res[blockIdx.x + 1] (the mask rows 1..proposals)
+    const int p = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* rr = res + (size_t) (p + 1) * C;
+    const int n4 = C >> 2;
+    const float4* r4 = (const float4*) rr;
+    float a = 0.0f;
+    for (int i = tid; i < n4; i += 256) {
+        const float4 v = __ldg(r4 + i);
+        a += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if (lane == 0) sh[warp] = a;
+    __syncthreads();
+    if (warp == 0) {
+        float s = lane < 8 ? sh[lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (lane == 0) sh[0] = rsqrtf(s / (float) C + eps);
+    }
+    __syncthreads();
+    const float rs = sh[0];
+    const float4* w4 = (const float4*) w;
+    uint2* o16 = (uint2*) (x16 + (size_t) p * C);
+    uint2* obf = (uint2*) (xbf + (size_t) p * C);
+    for (int i = tid; i < n4; i += 256) {
+        const float4 v = __ldg(r4 + i), ww = __ldg(w4 + i);
+        const float r0 = v.x * rs * ww.x, r1 = v.y * rs * ww.y, r2 = v.z * rs * ww.z, r3 = v.w * rs * ww.w;
+        const uint16_t h0 = __half_as_ushort(__float2half_rn(r0)), h1 = __half_as_ushort(__float2half_rn(r1));
+        const uint16_t h2 = __half_as_ushort(__float2half_rn(r2)), h3 = __half_as_ushort(__float2half_rn(r3));
+        o16[i] = make_uint2((uint32_t) h0 | ((uint32_t) h1 << 16), (uint32_t) h2 | ((uint32_t) h3 << 16));
+        const uint16_t b0 = df_f2bf_rn(r0), b1 = df_f2bf_rn(r1), b2 = df_f2bf_rn(r2), b3 = df_f2bf_rn(r3);
+        obf[i] = make_uint2((uint32_t) b0 | ((uint32_t) b1 << 16), (uint32_t) b2 | ((uint32_t) b3 << 16));
+    }
+}
+
+__global__ void dflash_init_block_kernel(const float* anchor_h, const float* mask, float* res, int* pos, int T, int C,
+                                         const DflashSelMeta* meta) {
+    const int t = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t == 0 && blockIdx.x == 0 && threadIdx.x < T) pos[threadIdx.x] = meta->P + threadIdx.x;
+    if (c < C) res[(size_t) t * C + c] = (t == 0 ? anchor_h : mask)[c];
+}
+
+__device__ __forceinline__ float df_half_warp_max(float v) {
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ float df_half_warp_sum(float v) {
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float df_warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// Split non-causal sliding-window attention for DFlash 2 (G * rows <= 32, D = 128).
+// Reads n_past from meta->P so the launch is 100% CUDA-graphable across all positions.
+__global__ void __launch_bounds__(256) dflash_attn_split_kernel(
+    const float* __restrict__ Q, const uint16_t* __restrict__ Kr, const uint16_t* __restrict__ Vr,
+    const float* __restrict__ Kb, const float* __restrict__ Vb, int rows, int n_head, int n_kv,
+    const DflashSelMeta* __restrict__ meta, int ring, int window, float scale, int splits,
+    float* __restrict__ part) {
+    __shared__ float qs[kDflashAttnQ * 129];
+    __shared__ float ks[kDflashAttnKeys * 129];
+    __shared__ float vs[kDflashAttnKeys * 128];
+    __shared__ float sc[kDflashAttnQ * kDflashAttnKeys];
+    __shared__ float mrun[kDflashAttnQ], lrun[kDflashAttnQ], corr[kDflashAttnQ];
+    __shared__ int kp[kDflashAttnKeys];
+    const int t = threadIdx.x, kvh = blockIdx.x, G = n_head / n_kv, nq = G * rows, kvd = n_kv * 128;
+    const int n_past = meta->P;
+    const int lo0 = max(0, n_past - window + 1);
+    const int nc = n_past > lo0 ? (n_past - lo0) : 0;
+    const int nk = nc + rows;
+    const int chunks = (nk + kDflashAttnKeys - 1) / kDflashAttnKeys;
+    const int per_split = max(kDflashAttnKeys, ((chunks + splits - 1) / splits) * kDflashAttnKeys);
+    const int k0 = blockIdx.y * per_split, k1 = min(nk, k0 + per_split);
+    for (int e = t; e < kDflashAttnQ * 128; e += 256) {
+        const int q = e >> 7, dd = e & 127;
+        qs[q * 129 + dd] = q < nq ? Q[((size_t) (q % rows) * n_head + kvh * G + q / rows) * 128 + dd] : 0.0f;
+    }
+    if (t < kDflashAttnQ) {
+        mrun[t] = -INFINITY;
+        lrun[t] = 0.0f;
+    }
+    const int d = t & 127, qh = t >> 7, j = t & 15;
+    float acc[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) acc[r] = 0.0f;
+    for (int c = k0; c < k1; c += kDflashAttnKeys) {
+        __syncthreads();
+        if (t < kDflashAttnKeys) {
+            const int k = c + t;
+            kp[t] = (k >= k1) ? -2 : (k >= nc ? -1 : (lo0 + k));
+        }
+        __syncthreads();
+        for (int e = t; e < kDflashAttnKeys * 128; e += 256) {
+            const int jj = e >> 7, dd = e & 127;
+            const int pos = kp[jj];
+            float kv = 0.0f, vv = 0.0f;
+            if (pos >= 0) {
+                const size_t off = (size_t) (pos % ring) * kvd + (size_t) kvh * 128 + dd;
+                kv = __half2float(__ushort_as_half(Kr[off]));
+                vv = __half2float(__ushort_as_half(Vr[off]));
+            } else if (pos == -1) {
+                const size_t off = (size_t) (c + jj - nc) * kvd + (size_t) kvh * 128 + dd;
+                kv = Kb[off];
+                vv = Vb[off];
+            }
+            ks[jj * 129 + dd] = kv;
+            vs[jj * 128 + dd] = vv;
+        }
+        __syncthreads();
+        const int pos = kp[j];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int q = (t >> 4) + 16 * r;
+            float sv = -INFINITY;
+            if (q < nq && pos != -2 && (pos == -1 || pos >= n_past + (q % rows) - window + 1)) {
+                float a = 0.0f;
+#pragma unroll 8
+                for (int e = 0; e < 128; ++e) a = fmaf(qs[q * 129 + e], ks[j * 129 + e], a);
+                sv = a * scale;
+            }
+            const float mo = mrun[q];
+            const float mn = fmaxf(mo, df_half_warp_max(sv));
+            const float pw = sv == -INFINITY ? 0.0f : expf(sv - mn);
+            sc[q * kDflashAttnKeys + j] = pw;
+            const float ps = df_half_warp_sum(pw);
+            __syncwarp();
+            if (j == 0) {
+                const float cf = mo == -INFINITY ? 0.0f : expf(mo - mn);
+                corr[q] = cf;
+                lrun[q] = lrun[q] * cf + ps;
+                mrun[q] = mn;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const int q = qh * 16 + r;
+            float a = acc[r] * corr[q];
+#pragma unroll
+            for (int k = 0; k < kDflashAttnKeys; ++k) a = fmaf(sc[q * kDflashAttnKeys + k], vs[k * 128 + d], a);
+            acc[r] = a;
+        }
+    }
+    __syncthreads();
+    float* P = part + ((size_t) blockIdx.y * n_kv + kvh) * kDflashAttnQ * kDflashAttnPart;
+#pragma unroll
+    for (int r = 0; r < 16; ++r) P[(size_t) (qh * 16 + r) * kDflashAttnPart + 2 + d] = acc[r];
+    if (t < kDflashAttnQ) {
+        P[(size_t) t * kDflashAttnPart] = mrun[t];
+        P[(size_t) t * kDflashAttnPart + 1] = lrun[t];
+    }
+}
+
+__global__ void dflash_attn_merge_kernel(const float* __restrict__ part, int splits, int rows, int n_head, int n_kv,
+                                         float* __restrict__ out) {
+    const int h = blockIdx.x, i = blockIdx.y, d = threadIdx.x, G = n_head / n_kv;
+    const int kvh = h / G, q = (h % G) * rows + i;
+    float M = -INFINITY;
+    for (int s = 0; s < splits; ++s) M = fmaxf(M, part[(((size_t) s * n_kv + kvh) * kDflashAttnQ + q) * kDflashAttnPart]);
+    float L = 0.0f, a = 0.0f;
+    if (M != -INFINITY) {
+        for (int s = 0; s < splits; ++s) {
+            const float* P = part + (((size_t) s * n_kv + kvh) * kDflashAttnQ + q) * kDflashAttnPart;
+            if (P[0] == -INFINITY) continue;
+            const float f = expf(P[0] - M);
+            L += f * P[1];
+            a = fmaf(f, P[2 + d], a);
+        }
+    }
+    out[((size_t) i * n_head + h) * 128 + d] = L > 0.0f ? a / L : 0.0f;
+}
+
+__device__ __forceinline__ bool df_tk_before(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
+__device__ __forceinline__ bool df_tk_after(float v, int i, float lv, int li) { return v < lv || (v == lv && i > li); }
+
+__global__ void __launch_bounds__(256) dflash_topk_part_kernel(const float* __restrict__ x, int ld, int n, int k,
+                                                               int slice, int* __restrict__ part_i,
+                                                               float* __restrict__ part_v) {
+    extern __shared__ float xs[];
+    __shared__ float bv[8];
+    __shared__ int bi[8];
+    __shared__ float last_v;
+    __shared__ int last_i;
+    const int lo = blockIdx.x * slice, len = max(0, min(n - lo, slice));
+    const float* xr = x + (size_t) blockIdx.y * ld + lo;
+    for (int i = threadIdx.x; i < len; i += 256) xs[i] = xr[i];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (threadIdx.x == 0) last_v = INFINITY, last_i = -1;
+    __syncthreads();
+    const size_t o = ((size_t) blockIdx.y * kDflashTopKSlices + blockIdx.x) * k;
+    for (int r = 0; r < k; ++r) {
+        const float lv = last_v;
+        const int li = last_i;
+        float v = -INFINITY;
+        int vi = 0x7fffffff;
+        for (int i = threadIdx.x; i < len; i += 256) {
+            const float y = xs[i];
+            if (df_tk_after(y, lo + i, lv, li) && df_tk_before(y, lo + i, v, vi)) v = y, vi = lo + i;
+        }
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, d);
+            const int oi = __shfl_xor_sync(0xffffffffu, vi, d);
+            if (df_tk_before(ov, oi, v, vi)) v = ov, vi = oi;
+        }
+        if (lane == 0) bv[w] = v, bi[w] = vi;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = bv[0];
+            int bj = bi[0];
+            for (int j = 1; j < 8; ++j)
+                if (df_tk_before(bv[j], bi[j], b, bj)) b = bv[j], bj = bi[j];
+            part_i[o + r] = bj;
+            part_v[o + r] = b;
+            last_v = b;
+            last_i = bj;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void __launch_bounds__(32) dflash_topk_merge_kernel(const int* __restrict__ part_i,
+                                                               const float* __restrict__ part_v, int k,
+                                                               int* __restrict__ ids, float* __restrict__ vals) {
+    extern __shared__ float cv[];
+    const int c = kDflashTopKSlices * k;
+    int* ci = (int*) (cv + c);
+    const size_t o = (size_t) blockIdx.x * c;
+    for (int j = threadIdx.x; j < c; j += 32) {
+        cv[j] = part_v[o + j];
+        ci[j] = part_i[o + j];
+    }
+    __syncwarp();
+    float lv = INFINITY;
+    int li = -1;
+    for (int r = 0; r < k; ++r) {
+        float v = -INFINITY;
+        int vi = 0x7fffffff;
+        for (int j = threadIdx.x; j < c; j += 32) {
+            const float y = cv[j];
+            const int yi = ci[j];
+            if (df_tk_after(y, yi, lv, li) && df_tk_before(y, yi, v, vi)) v = y, vi = yi;
+        }
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, d);
+            const int oi = __shfl_xor_sync(0xffffffffu, vi, d);
+            if (df_tk_before(ov, oi, v, vi)) v = ov, vi = oi;
+        }
+        if (threadIdx.x == 0) {
+            ids[(size_t) blockIdx.x * k + r] = vi;
+            vals[(size_t) blockIdx.x * k + r] = v;
+        }
+        lv = v;
+        li = vi;
+    }
+}
+
+// Single-block candidate selector walk (both greedy when inv_temp <= 0 and exact stochastic when inv_temp > 0).
+// Matches SGLang CandidateSelector.build_lattice + sample_path with after_correction / before_correction softcap.
+__global__ void dflash_walk_kernel(const int* __restrict__ cand, const float* __restrict__ lg,
+                                   const float* __restrict__ gate, int k, int rank, const uint16_t* __restrict__ prev_tab,
+                                   const uint16_t* __restrict__ next_tab, const DflashSelMeta* __restrict__ meta,
+                                   int n, float softcap, bool post_softcap, DflashOutHost* __restrict__ out) {
+    __shared__ float as[1024];
+    __shared__ float s[kDflashTopKMax];
+    __shared__ int pred;
+    const int r = threadIdx.x, lane = r & 31, w = r >> 5, nw = (int) (blockDim.x >> 5);
+    if (r == 0) pred = meta->anchor;
+    __syncthreads();
+    const float inv_t = meta->inv_temp;
+    const float inv_cap = softcap > 0.0f ? (1.0f / softcap) : 0.0f;
+    for (int i = 0; i < n; ++i) {
+        as[r] = df_bf2f(prev_tab[(size_t) pred * rank + r]) * gate[(size_t) i * rank + r];
+        __syncthreads();
+        for (int j = w; j < k; j += nw) {
+            const int cid = cand[(size_t) i * k + j];
+            float dot = 0.0f;
+            for (int e = lane; e < rank; e += 32) dot = fmaf(as[e], df_bf2f(next_tab[(size_t) cid * rank + e]), dot);
+            dot = df_warp_sum(dot);
+            if (lane == 0) {
+                float u = lg[(size_t) i * k + j];
+                if (!post_softcap && softcap > 0.0f) u = softcap * tanhf(u * inv_cap);
+                float sc = u + dot;
+                if (post_softcap && softcap > 0.0f) sc = softcap * tanhf(sc * inv_cap);
+                s[j] = sc;
+            }
+        }
+        __syncthreads();
+        if (r == 0) {
+            if (inv_t <= 0.0f) {
+                int b = 0;
+                for (int j = 1; j < k; ++j)
+                    if (s[j] > s[b] || (s[j] == s[b] && cand[(size_t) i * k + j] < cand[(size_t) i * k + b])) b = j;
+                const int pick_id = cand[(size_t) i * k + b];
+                out->tok[i] = pick_id;
+                out->q_tok[i] = 1.0f;
+                pred = pick_id;
+            } else {
+                float vmax = s[0];
+                for (int j = 1; j < k; ++j)
+                    if (s[j] > vmax) vmax = s[j];
+                double pr[kDflashTopKMax];
+                double z = 0.0;
+                for (int j = 0; j < k; ++j) {
+                    pr[j] = exp(((double) s[j] - (double) vmax) * (double) inv_t);
+                    z += pr[j];
+                }
+                float qf[kDflashTopKMax];
+                double sum_q = 0.0;
+                const double inv_z = z > 0.0 ? (1.0 / z) : 0.0;
+                for (int j = 0; j < k; ++j) {
+                    qf[j] = (float) (pr[j] * inv_z);
+                    sum_q += (double) qf[j];
+                }
+                double tot = 0.0;
+                const double inv_sq = sum_q > 0.0 ? (1.0 / sum_q) : 0.0;
+                for (int j = 0; j < k; ++j) {
+                    qf[j] = sum_q > 0.0 ? (float) ((double) qf[j] * inv_sq) : (j == 0 ? 1.0f : 0.0f);
+                    tot += (double) qf[j];
+                    out->q[i * k + j] = qf[j];
+                    out->cand_id[i * k + j] = cand[(size_t) i * k + j];
+                }
+                double u = (double) meta->u[i] * tot;
+                int pick = k - 1;
+                for (int j = 0; j < k; ++j) {
+                    u -= (double) qf[j];
+                    if (u <= 0.0) {
+                        pick = j;
+                        break;
+                    }
+                }
+                const int pick_id = cand[(size_t) i * k + pick];
+                out->tok[i] = pick_id;
+                out->q_tok[i] = qf[pick];
+                pred = pick_id;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 uint16_t* up16(Drafter* d, const std::vector<uint16_t>& v) {
     uint16_t* p = dalloc<uint16_t>(v.size());
     cu(cudaMemcpy(p, v.data(), v.size() * 2, cudaMemcpyHostToDevice), "upload");
@@ -559,8 +1131,182 @@ const std::vector<int>& tap_layers() {
     return v;
 }
 
+Drafter* load_dflash2(const StFile& f, int C, int ctx, cublasHandle_t blas, cudaStream_t s) {
+    auto* d = new Drafter;
+    d->is_dflash2 = true;
+    d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
+    const std::string cfg = sibling_config_json(f.path);
+    d->mask_tok = cfg_int(cfg, "mask_token_id", 200056);
+    d->window = cfg_int(cfg, "sliding_window", 2048);
+    d->eps = cfg_float(cfg, "rms_norm_eps", 1e-6f);
+    d->theta = cfg_float(cfg, "rope_theta", 10000.0f);
+    d->softcap = cfg_float(cfg, "final_logit_softcapping", 30.0f);
+    d->top_k = cfg_int(cfg, "selector_top_k", 16);
+    d->conv_taps = cfg_int(cfg, "conv_kernel_size", 2);
+    d->conv_group = cfg_int(cfg, "conv_group_size", 16);
+    d->post_softcap = cfg_str(cfg, "selector_softcap_mode", "after_correction") == "after_correction";
+    if (d->top_k < 1 || d->top_k > kDflashTopKMax)
+        throw std::runtime_error("drafter: DFlash2 selector_top_k out of range");
+    if (d->conv_group <= 0 || C % d->conv_group != 0)
+        throw std::runtime_error("drafter: DFlash2 conv_group_size does not divide C");
+
+    const auto& fc_t = f.t.at("fc.weight");
+    if (fc_t.shape.size() != 2 || fc_t.shape[0] != C || fc_t.shape[1] % C != 0)
+        throw std::runtime_error("drafter: DFlash2 fc.weight shape mismatch");
+    d->taps = (int) (fc_t.shape[1] / C);
+
+    int layers = 0;
+    while (f.t.count("layers." + std::to_string(layers) + ".input_layernorm.weight")) ++layers;
+    if (layers <= 0) throw std::runtime_error("drafter: DFlash2 has no layers");
+
+    const auto& q0 = f.t.at("layers.0.self_attn.q_proj.weight");
+    const auto& k0 = f.t.at("layers.0.self_attn.k_proj.weight");
+    const auto& g0 = f.t.at("layers.0.mlp.gate_proj.weight");
+    const auto& sh0 = f.t.at("candidate_selector.hidden_projection.weight");
+    const auto& sp0 = f.t.at("candidate_selector.predecessor_codebook");
+    if (q0.shape.size() != 2 || q0.shape[0] % 128 != 0 || k0.shape.size() != 2 || k0.shape[0] % 128 != 0)
+        throw std::runtime_error("drafter: DFlash2 attention projection shape mismatch");
+    d->H = (int) (q0.shape[0] / 128);
+    d->KV = (int) (k0.shape[0] / 128);
+    d->F = (int) g0.shape[0];
+    d->R = (int) sh0.shape[0];
+    d->V = (int) sp0.shape[0];
+    d->cap = d->window;
+    d->cdyn = 2 * d->conv_taps * (C / d->conv_group);
+    if ((d->H / d->KV) * kBlock > kDflashAttnQ)
+        throw std::runtime_error("drafter: DFlash2 (H/KV)*block exceeds kDflashAttnQ");
+    if (d->R <= 0 || d->R > 1024 || (d->R & 31) != 0)
+        throw std::runtime_error("drafter: DFlash2 selector_rank must be a multiple of 32 <= 1024");
+
+    const int64_t H = d->H, KV = d->KV, F = d->F, R = d->R;
+    d->fc_w = up16(d, st_bf16(f, "fc.weight", {C, (int64_t) d->taps * C}));
+    d->hidden_norm = up32(d, st_bf16(f, "hidden_norm.weight", {C}));
+    d->norm = up32(d, st_bf16(f, "norm.weight", {C}));
+    d->mask = dalloc<float>(C);
+    cu(cudaMemset(d->mask, 0, (size_t) C * sizeof(float)), "mask zero");
+    d->vram += (size_t) C * sizeof(float);
+    d->sel_hidden = up16(d, st_bf16(f, "candidate_selector.hidden_projection.weight", {R, C}));
+    d->sel_prev = up16(d, st_bf16(f, "candidate_selector.predecessor_codebook", {d->V, R}));
+    d->sel_next = up16(d, st_bf16(f, "candidate_selector.successor_codebook", {d->V, R}));
+
+    d->L.resize(layers);
+    for (int i = 0; i < layers; ++i) {
+        DLayer& l = d->L[i];
+        const std::string b = "layers." + std::to_string(i) + ".";
+        l.local = true;
+        l.in_norm = up32(d, st_bf16(f, b + "input_layernorm.weight", {C}));
+        l.post_norm = up32(d, st_bf16(f, b + "post_attention_layernorm.weight", {C}));
+        l.q_norm = up32(d, st_bf16(f, b + "self_attn.q_norm.weight", {128}));
+        l.k_norm = up32(d, st_bf16(f, b + "self_attn.k_norm.weight", {128}));
+        l.attn_conv_base = up32(d, st_bf16(f, b + "attention_conv.base_kernel", {2, d->conv_taps, C}));
+        l.attn_conv_w = up16(d, st_bf16(f, b + "attention_conv.kernel_projection.weight", {d->cdyn, C}));
+        l.mlp_conv_base = up32(d, st_bf16(f, b + "mlp_conv.base_kernel", {2, d->conv_taps, C}));
+        l.mlp_conv_w = up16(d, st_bf16(f, b + "mlp_conv.kernel_projection.weight", {d->cdyn, C}));
+        {
+            auto qkv = st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C});
+            const auto wk = st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C});
+            const auto wv = st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C});
+            qkv.insert(qkv.end(), wk.begin(), wk.end());
+            qkv.insert(qkv.end(), wv.begin(), wv.end());
+            l.wqkv = up16(d, qkv);
+            // Context K/V shares the exact same k_proj / v_proj weights (no duplication in VRAM).
+            l.wkvc = l.wqkv + (size_t) H * 128 * C;
+        }
+        l.wo = up16(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}));
+        {
+            auto g = st_bf16(f, b + "mlp.gate_proj.weight", {F, C});
+            const auto u = st_bf16(f, b + "mlp.up_proj.weight", {F, C});
+            g.insert(g.end(), u.begin(), u.end());
+            l.wgu = up16(d, g);
+        }
+        l.wd = up16(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}));
+        l.cap = d->window;
+        l.kc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
+        l.vc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
+        d->vram += (size_t) l.cap * KV * 128 * 4;
+    }
+
+    const size_t T = kBlock;
+    d->fc_in = dalloc<uint16_t>((size_t) kMixRows * d->taps * C);
+    d->mix = dalloc<float>((size_t) kMixRows * C);
+    d->ctx_tmp = dalloc<float>((size_t) 2 * kMixRows * KV * 128);
+    d->x = dalloc<float>(T * C);
+    d->res = dalloc<float>(T * C);
+    d->h = dalloc<float>(T * C);
+    d->cbuf = dalloc<float>(T * d->cdyn);
+    d->qkv = dalloc<float>(T * (H + 2 * KV) * 128);
+    d->q = dalloc<float>(T * H * 128);
+    d->o = dalloc<float>(T * H * 128);
+    d->kk = dalloc<float>(T * KV * 128);
+    d->vv = dalloc<float>(T * KV * 128);
+    d->gu = dalloc<float>(T * 2 * F);
+    d->hb = dalloc<uint16_t>(std::max<size_t>(T * std::max<int64_t>(C, H * 128), (size_t) kMixRows * C));
+    d->hb2 = dalloc<uint16_t>(T * F);
+    d->x16 = dalloc<__half>((kBlock - 1) * (size_t) C);
+    d->pos = dalloc<int>(T);
+    d->attn_part = dalloc<float>((size_t) kDflashAttnSplits * KV * kDflashAttnQ * kDflashAttnPart);
+    d->sel_g = dalloc<float>((size_t) (kBlock - 1) * R);
+    d->part_id = dalloc<int>((size_t) (kBlock - 1) * kDflashTopKSlices * d->top_k);
+    d->part_lg = dalloc<float>((size_t) (kBlock - 1) * kDflashTopKSlices * d->top_k);
+    d->sel_id = dalloc<int>((size_t) (kBlock - 1) * d->top_k);
+    d->sel_lg = dalloc<float>((size_t) (kBlock - 1) * d->top_k);
+    d->ctx_meta_d = dalloc<int>(1);
+    d->df_meta_d = dalloc<DflashSelMeta>(1);
+    d->df_out_d = dalloc<DflashOutHost>(1);
+    cu(cudaHostAlloc(&d->ctx_meta_h, sizeof(int), cudaHostAllocDefault), "ctx_meta_h");
+    cu(cudaHostAlloc(&d->df_meta_h, sizeof(DflashSelMeta), cudaHostAllocDefault), "df_meta_h");
+    cu(cudaHostAlloc(&d->df_out_h, sizeof(DflashOutHost), cudaHostAllocDefault), "df_out_h");
+    d->vram += (size_t) kMixRows * d->taps * C * 2 + (size_t) kMixRows * C * 4 + (size_t) 2 * kMixRows * KV * 128 * 4 +
+               (size_t) kDflashAttnSplits * KV * kDflashAttnQ * kDflashAttnPart * 4;
+    return d;
+}
+
+bool is_dflash2(const Drafter* d) { return d && d->is_dflash2; }
+int mask_token_id(const Drafter* d) { return (d && d->is_dflash2) ? d->mask_tok : -1; }
+void set_mask_embed(Drafter* d, const float* mask_h) {
+    if (!d || !d->mask || !mask_h) return;
+    cu(cudaMemcpyAsync(d->mask, mask_h, (size_t) d->C * sizeof(float), cudaMemcpyDeviceToDevice, d->s),
+       "set_mask_embed");
+}
+void vram_estimate(const std::string& path, int KV, int D, int ctx, size_t& fixed_bytes, size_t& per_tok_bytes) {
+    fixed_bytes = 0;
+    per_tok_bytes = 0;
+    size_t file_b = 0;
+    if (FILE* df = std::fopen(path.c_str(), "rb")) {
+        std::fseek(df, 0, SEEK_END);
+        file_b = (size_t) std::max<long>(0, std::ftell(df));
+        std::fclose(df);
+    }
+    bool df2 = false;
+    int df2_layers = 5, df2_window = 2048;
+    try {
+        const StFile f = st_open(path);
+        df2 = f.t.count("fc.weight") && f.t.count("candidate_selector.hidden_projection.weight");
+        if (df2) {
+            int l = 0;
+            while (f.t.count("layers." + std::to_string(l) + ".input_layernorm.weight")) ++l;
+            if (l > 0) df2_layers = l;
+            df2_window = cfg_int(sibling_config_json(path), "sliding_window", 2048);
+        }
+    } catch (...) {
+    }
+    if (df2) {
+        // All layers are sliding-window FP16 rings: fixed VRAM, zero per-context-token growth.
+        fixed_bytes = file_b + (size_t) df2_layers * (size_t) df2_window * (size_t) KV * (size_t) D * 4 + (64ULL << 20);
+        per_tok_bytes = 0;
+        return;
+    }
+    const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : 0;
+    const size_t per = (size_t) KV * (size_t) D * 2 * 2;
+    fixed_bytes = file_b + (size_t) 2 * (size_t) std::min(ctx, 2048) * (size_t) KV * (size_t) D * 8 + (256ULL << 20);
+    if (want > 0) fixed_bytes += (size_t) std::min(ctx, std::max(want, 2048)) * per;
+    else per_tok_bytes = per;
+}
+
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s) {
     const StFile f = st_open(path);
+    if (f.t.count("fc.weight") && f.t.count("candidate_selector.hidden_projection.weight"))
+        return load_dflash2(f, C, ctx, blas, s);
     auto* d = new Drafter;
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
     {
@@ -677,9 +1423,14 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
 }
 
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
-    const int C = d->C, R = d->R;
     d->n_rows = n_rows;
     d->fold_ld = (n_rows + 7) & ~7;
+    if (d->is_dflash2) {
+        d->base = dalloc<float>((size_t) (kBlock - 1) * d->fold_ld);
+        d->vram += (size_t) (kBlock - 1) * d->fold_ld * 4;
+        return;
+    }
+    const int C = d->C, R = d->R;
     if (getenv("IK2_DRAFT_SHORTLIST") && atoi(getenv("IK2_DRAFT_SHORTLIST"))) {
         const int stride = (n_rows + 31) / 32;
         d->shortlist = dalloc<int>((kBlock - 1) * stride);
@@ -725,6 +1476,25 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
 
 static void write_context_impl(Drafter* d, const float* taps, int ld, int r0, int m, int pos0, const int* pos_d) {
     const int C = d->C, KD = d->KV * 128;
+    if (d->is_dflash2) {
+        // All layers are sliding rings of size d->window: if prefill passes > window rows at once, older rows would be
+        // immediately overwritten by later rows in the same chunk.
+        const int skip = pos_d ? 0 : std::max(0, m - d->window);
+        for (int a = skip; a < m;) {
+            const int n = std::min(kMixRows, m - a);
+            dflash_cat_taps_bf16_kernel<<<dim3((unsigned) d->taps, (unsigned) n), 256, 0, d->s>>>(
+                taps + (size_t) (r0 + a) * C, d->taps, (size_t) ld * C, C, d->fc_in);
+            gemm_bf(d, d->fc_w, C, d->taps * C, d->fc_in, n, d->mix, C);
+            dflash_rms_bf16_kernel<<<(unsigned) n, 256, 0, d->s>>>(d->mix, d->hidden_norm, C, d->eps, d->hb);
+            for (auto& l : d->L) {
+                gemm_bf(d, l.wkvc, 2 * KD, C, d->hb, n, d->ctx_tmp, 2 * KD);
+                draft_ctx_kv_store_kernel<true><<<dim3((unsigned) (2 * d->KV), (unsigned) n), 128, 0, d->s>>>(
+                    d->ctx_tmp, l.k_norm, pos0 + a, pos_d, l.cap, d->KV, d->eps, d->theta, l.kc16, l.vc16);
+            }
+            a += n;
+        }
+        return;
+    }
     const bool vec4 = (C & 3) == 0;
     for (auto& l : d->L) {
         const int li = (int) (&l - d->L.data());
@@ -756,6 +1526,7 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
 }
 
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
+    if (d->is_dflash2) return;
     k::mix_rms(taps + (size_t) row * d->C, d->taps, (size_t) ld * d->C, 1, d->C, d->alpha + d->L.size() * d->taps, d->mk_dflare,
                d->eps, d->f_rnn, d->s);
 }
@@ -787,8 +1558,140 @@ void commit_context(Drafter* d, const float* taps, int ld, int m, int pos0, bool
     }
 }
 
+namespace {
+
+void launch_dflash2_body(Drafter* d, const float* anchor_h, const uint16_t* lm_f16, int n_rows, int n_vocab,
+                         int proposals, cudaEvent_t* pe = nullptr) {
+    const int C = d->C, T = kBlock, HD = d->H * 128, KD = d->KV * 128, fld = d->fold_ld;
+    const float scale = 1.0f / std::sqrt(128.0f);
+    cu(cudaMemcpyAsync(d->df_meta_d, d->df_meta_h, sizeof(DflashSelMeta), cudaMemcpyHostToDevice, d->s), "df meta");
+    dflash_init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
+        anchor_h, d->mask, d->res, d->pos, T, C, d->df_meta_d);
+    for (auto& l : d->L) {
+        // Attention sublayer wrapped by grouped 2-tap dynamic conv
+        dflash_rms_f32_bf16_kernel<<<(unsigned) T, 256, 0, d->s>>>(d->res, l.in_norm, C, d->eps, d->x, d->hb);
+        gemm_bf(d, l.attn_conv_w, d->cdyn, C, d->hb, T, d->cbuf, d->cdyn);
+        dflash_conv_side0_bf16_kernel<<<(unsigned) T, 256, 0, d->s>>>(
+            d->x, d->cbuf, d->cdyn, l.attn_conv_base, C, d->conv_taps, d->conv_group, d->hb);
+        gemm_bf(d, l.wqkv, HD + 2 * KD, C, d->hb, T, d->qkv, HD + 2 * KD);
+        draft_qkv_norm_rope_kernel<<<dim3((unsigned) (d->H + 2 * d->KV), (unsigned) T), 128, 0, d->s>>>(
+            d->qkv, l.q_norm, l.k_norm, d->pos, d->H, d->KV, d->eps, d->theta, d->q, d->kk, d->vv);
+        dflash_attn_split_kernel<<<dim3((unsigned) d->KV, (unsigned) kDflashAttnSplits), 256, 0, d->s>>>(
+            d->q, l.kc16, l.vc16, d->kk, d->vv, T, d->H, d->KV, d->df_meta_d, l.cap, d->window, scale,
+            kDflashAttnSplits, d->attn_part);
+        dflash_attn_merge_kernel<<<dim3((unsigned) d->H, (unsigned) T), 128, 0, d->s>>>(
+            d->attn_part, kDflashAttnSplits, T, d->H, d->KV, d->o);
+        k::to_bf16(d->o, (size_t) T * HD, d->hb, d->s);
+        gemm_bf(d, l.wo, C, HD, d->hb, T, d->x, C);
+        dflash_conv_side1_add_kernel<<<(unsigned) T, 256, 0, d->s>>>(
+            d->x, d->cbuf, d->cdyn, l.attn_conv_base, C, d->conv_taps, d->conv_group, d->res);
+        // MLP sublayer wrapped by grouped 2-tap dynamic conv
+        dflash_rms_f32_bf16_kernel<<<(unsigned) T, 256, 0, d->s>>>(d->res, l.post_norm, C, d->eps, d->x, d->hb);
+        gemm_bf(d, l.mlp_conv_w, d->cdyn, C, d->hb, T, d->cbuf, d->cdyn);
+        dflash_conv_side0_bf16_kernel<<<(unsigned) T, 256, 0, d->s>>>(
+            d->x, d->cbuf, d->cdyn, l.mlp_conv_base, C, d->conv_taps, d->conv_group, d->hb);
+        gemm_bf(d, l.wgu, 2 * d->F, C, d->hb, T, d->gu, 2 * d->F);
+        k::silu_mul_bf16(d->gu, T, d->F, d->hb2, d->s);
+        gemm_bf(d, l.wd, C, d->F, d->hb2, T, d->x, C);
+        dflash_conv_side1_add_kernel<<<(unsigned) T, 256, 0, d->s>>>(
+            d->x, d->cbuf, d->cdyn, l.mlp_conv_base, C, d->conv_taps, d->conv_group, d->res);
+    }
+    // Final norm on mask rows 1..proposals -> FP16 x16 (lm_head) + BF16 hb (selector hidden_projection)
+    dflash_final_rms_f16_bf16_kernel<<<(unsigned) proposals, 256, 0, d->s>>>(
+        d->res, d->norm, C, d->eps, d->x16, d->hb);
+    if (pe) cu(cudaEventRecord(pe[1], d->s), "df2 pe1");
+    if (d->head_q8)
+        k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, fld, d->s);
+    else
+        gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, fld);
+    if (pe) cu(cudaEventRecord(pe[2], d->s), "df2 pe2");
+    gemm_bf(d, d->sel_hidden, d->R, C, d->hb, proposals, d->sel_g, d->R);
+    const int slice = (n_vocab + kDflashTopKSlices - 1) / kDflashTopKSlices;
+    dflash_topk_part_kernel<<<dim3((unsigned) kDflashTopKSlices, (unsigned) proposals), 256,
+                              (size_t) slice * sizeof(float), d->s>>>(
+        d->base, fld, n_vocab, d->top_k, slice, d->part_id, d->part_lg);
+    dflash_topk_merge_kernel<<<(unsigned) proposals, 32,
+                               (size_t) kDflashTopKSlices * d->top_k * (sizeof(float) + sizeof(int)), d->s>>>(
+        d->part_id, d->part_lg, d->top_k, d->sel_id, d->sel_lg);
+    if (pe) cu(cudaEventRecord(pe[3], d->s), "df2 pe3");
+    dflash_walk_kernel<<<1, (unsigned) d->R, 0, d->s>>>(
+        d->sel_id, d->sel_lg, d->sel_g, d->top_k, d->R, d->sel_prev, d->sel_next, d->df_meta_d, proposals, d->softcap,
+        d->post_softcap, d->df_out_d);
+    cu(cudaMemcpyAsync(d->df_out_h, d->df_out_d, sizeof(DflashOutHost), cudaMemcpyDeviceToHost, d->s), "df out");
+}
+
+void run_dflash2(Drafter* d, const float* anchor_h, const uint16_t* lm_f16, int n_rows, int n_vocab, int proposals,
+                 bool* captured) {
+    if (captured) *captured = false;
+    static const bool spec_prof = getenv("IK2_SPEC_PROF") && atoi(getenv("IK2_SPEC_PROF"));
+    static const bool use_graph = !(getenv("IK2_DRAFT_GRAPH") && !atoi(getenv("IK2_DRAFT_GRAPH")));
+    static cudaEvent_t pe[5] = {};
+    static double pt[4] = {};
+    static int pcalls = 0;
+    if (spec_prof && !pe[0])
+        for (int i = 0; i < 5; ++i) cu(cudaEventCreate(&pe[i]), "df2 pe");
+    const bool can_graph = use_graph && d->blas_warmed && proposals >= 1 && proposals < kBlock &&
+                           (!d->graph_anchor || (d->graph_anchor == anchor_h && d->graph_lm == lm_f16 &&
+                                                 d->graph_n_rows == n_rows && d->graph_n_vocab == n_vocab));
+    if (can_graph) {
+        if (!d->pexec[proposals]) {
+            if (captured) *captured = true;
+            d->graph_anchor = anchor_h;
+            d->graph_lm = lm_f16;
+            d->graph_n_rows = n_rows;
+            d->graph_n_vocab = n_vocab;
+            cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeGlobal), "df2 capture begin");
+            launch_dflash2_body(d, anchor_h, lm_f16, n_rows, n_vocab, proposals, nullptr);
+            cu(cudaStreamEndCapture(d->s, &d->pgraph[proposals]), "df2 capture end");
+            cu(cudaGraphInstantiate(&d->pexec[proposals], d->pgraph[proposals], 0), "df2 graph inst");
+        }
+        if (spec_prof) cu(cudaEventRecord(pe[0], d->s), "df2 pe0");
+        cu(cudaGraphLaunch(d->pexec[proposals], d->s), "df2 graph launch");
+        if (spec_prof) cu(cudaEventRecord(pe[4], d->s), "df2 pe4");
+        cu(cudaStreamSynchronize(d->s), "df2 propose");
+        if (spec_prof && ++pcalls > 2) {
+            float ms = 0;
+            cu(cudaEventElapsedTime(&ms, pe[0], pe[4]), "df2 el");
+            pt[0] += ms;
+            if ((pcalls - 2) % 50 == 0) {
+                const int n = pcalls - 2;
+                std::fprintf(stderr, "df2_propose_prof_graph (%d calls): gpu=%.3f ms\n", n, pt[0] / n);
+            }
+        }
+    } else {
+        if (captured) *captured = true;
+        if (spec_prof) cu(cudaEventRecord(pe[0], d->s), "df2 pe0");
+        launch_dflash2_body(d, anchor_h, lm_f16, n_rows, n_vocab, proposals, spec_prof ? pe : nullptr);
+        if (spec_prof) cu(cudaEventRecord(pe[4], d->s), "df2 pe4");
+        cu(cudaStreamSynchronize(d->s), "df2 propose");
+        d->blas_warmed = true;
+        if (spec_prof && ++pcalls > 2) {
+            for (int i = 0; i < 4; ++i) {
+                float ms = 0;
+                cu(cudaEventElapsedTime(&ms, pe[i], pe[i + 1]), "df2 el");
+                pt[i] += ms;
+            }
+            if ((pcalls - 2) % 50 == 0) {
+                const int n = pcalls - 2;
+                std::fprintf(stderr, "df2_propose_prof (%d calls): layers=%.3f head=%.3f topk=%.3f walk+d2h=%.3f (gpu_sum=%.3f ms)\n",
+                             n, pt[0]/n, pt[1]/n, pt[2]/n, pt[3]/n, (pt[0]+pt[1]+pt[2]+pt[3])/n);
+            }
+        }
+    }
+}
+
+}  // namespace
+
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
              int* out, int proposals, bool* captured) {
+    if (d->is_dflash2) {
+        d->df_meta_h->P = P;
+        d->df_meta_h->anchor = anchor;
+        d->df_meta_h->inv_temp = 0.0f;
+        run_dflash2(d, anchor_h, lm_f16, n_rows, n_vocab, proposals, captured);
+        std::memcpy(out, d->df_out_h->tok, (size_t) proposals * sizeof(int));
+        return;
+    }
     if (captured) *captured = false;
     static const bool spec_prof = getenv("IK2_SPEC_PROF") && atoi(getenv("IK2_SPEC_PROF"));
     static const bool use_graph = !(getenv("IK2_DRAFT_GRAPH") && !atoi(getenv("IK2_DRAFT_GRAPH")));
@@ -983,6 +1886,23 @@ void sample_draft_dist(std::vector<std::pair<float, int>>& cd, double temp, doub
 void propose_sample(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows,
                     int n_vocab, float logit_cap, double temp, double top_p, int top_k, std::mt19937_64& rng,
                     DraftDist* out, int proposals, bool* captured) {
+    if (d->is_dflash2) {
+        d->df_meta_h->P = P;
+        d->df_meta_h->anchor = anchor;
+        d->df_meta_h->inv_temp = (float) (1.0 / std::max(1e-6, temp));
+        std::uniform_real_distribution<double> udist(0.0, 1.0);
+        for (int i = 0; i < proposals; ++i) d->df_meta_h->u[i] = (float) udist(rng);
+        run_dflash2(d, anchor_h, lm_f16, n_rows, n_vocab, proposals, captured);
+        const int K = d->top_k;
+        for (int i = 0; i < proposals; ++i) {
+            out[i].tok = d->df_out_h->tok[i];
+            out[i].q_tok = d->df_out_h->q_tok[i];
+            out[i].q.resize((size_t) K);
+            for (int j = 0; j < K; ++j)
+                out[i].q[(size_t) j] = {d->df_out_h->cand_id[i * K + j], d->df_out_h->q[i * K + j]};
+        }
+        return;
+    }
     if (captured) *captured = false;
     if (!d->cand_h || d->cand_n_vocab < n_vocab) {
         if (d->cand_part) cudaFree(d->cand_part);
@@ -1089,7 +2009,7 @@ size_t bytes(const Drafter* d) { return d->vram; }
 // - 1 (the positions themselves before a ring wraps, the whole ring after), K then V, and f_rnn last.
 size_t context_bytes(const Drafter* d, int P) {
     const size_t KD = (size_t) d->KV * 128;
-    size_t b = (size_t) d->C * 4;
+    size_t b = d->is_dflash2 ? 0 : (size_t) d->C * 4;
     for (const auto& l : d->L) b += 2 * (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
     return b;
 }
@@ -1156,7 +2076,7 @@ static void copy_context(Drafter* d, int P, uint8_t* host, bool save) {
         one(l.kc16 ? (void*) l.kc16 : (void*) l.kc, n);
         one(l.kc16 ? (void*) l.vc16 : (void*) l.vc, n);
     }
-    one(d->f_rnn, (size_t) d->C * 4);
+    if (!d->is_dflash2) one(d->f_rnn, (size_t) d->C * 4);
 }
 void save_context(Drafter* d, int P, uint8_t* out) { copy_context(d, P, out, true); }
 void load_context(Drafter* d, int P, const uint8_t* in) { copy_context(d, P, const_cast<uint8_t*>(in), false); }

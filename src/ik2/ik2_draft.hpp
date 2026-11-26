@@ -38,10 +38,21 @@ struct DraftDist {
 const std::vector<int>& tap_layers();
 constexpr int kTaps = 8, kBlock = 8;
 
-/// Loads mtp.safetensors (path) onto the current device; ctx: positions the context caches hold.  C: the target's
-/// width (4608).  Throws (std::runtime_error) on a file it does not understand.
+/// Loads a drafter safetensors checkpoint (DSpark mtp.safetensors or DFlash 2 model.safetensors) onto the current
+/// device; ctx: positions the context caches hold.  C: the target's width (2304 or 4608).  Throws (std::runtime_error)
+/// on a file it does not understand.
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s);
-/// The Markov head's bias folded through the target's output head (FP16 [n_rows][C], on the device).
+/// True when the loaded drafter is a DFlash 2 checkpoint (grouped conv + candidate selector, all-sliding ring).
+bool is_dflash2(const Drafter* d);
+/// Target token id whose normed embedding initializes mask rows for DFlash 2 (>= 0), or -1 if the drafter owns its own
+/// mask embedding (DSpark).
+int mask_token_id(const Drafter* d);
+/// Sets the DFlash 2 mask row embedding (device [C] F32, target embed_norm(embed_tokens[mask_token_id])).
+void set_mask_embed(Drafter* d, const float* mask_h);
+/// Estimates fixed and per-context-token VRAM bytes for a drafter checkpoint before loading it.
+void vram_estimate(const std::string& path, int KV, int D, int ctx, size_t& fixed_bytes, size_t& per_tok_bytes);
+/// The Markov head's bias folded through the target's output head (FP16 [n_rows][C], on the device; may be null for
+/// DFlash 2 when using set_head_q8).
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);
 /// The context caches for positions pos0 .. pos0 + m - 1 from tap rows r0 .. r0 + m - 1 (taps [8][ld][C] F32).
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0);
