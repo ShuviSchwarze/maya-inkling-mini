@@ -74,3 +74,32 @@ En el microbenchmark, cuBLAS sin decodificar (pesos ya en FP16) tarda 8,34 ms po
 - la reunión de filas;
 - el SwiGLU, que lee y escribe `gu32` en F32 (~0,3 GB por visita);
 - la suma ponderada en `tmp`.
+
+## Lo que no son experts: atención, proyecciones, residuales (2026-11-26)
+
+`IK2_PROF=1` ahora desglosa el prompt (`prompt profile: ...`). Prellenado de 16K, chunk 4096, `IK2_PF_NVFP4=1`, total 4,89 s:
+
+| Parte | s |
+|---|---:|
+| experts | 2,19 |
+| kernels de atención | 0,82 |
+| productos q/k/v/r/gate y convs | 0,72 |
+| residuales entre bloques y normas, antes de la atención | 0,41 |
+| producto y conv de la salida | 0,18 |
+| residual y norma antes de los experts | 0,18 |
+| router, preparación de q/k/v y resto | ~0,2 |
+
+Dos arreglos:
+- **`IK2_FA_BIAS=1`.** El sesgo relativo se armaba con un GEMM F32 de cuBLAS en una tabla de [512 queries × 24 cabezas][1024 distancias], 50 MB por cada 512 queries, escrita y releída por el kernel: ~150 GB por prompt de 16K. Ahora el kernel flash lo calcula por tile: (16 queries × 16 estados) · (16 × 80 distancias de `rel_proj`) con tres `mma.sync` FP16 (alto·alto, alto·bajo, bajo·alto), que dan el producto F32 con un error de ~2^-22. Lo escribe en el mismo búfer por warp que ya usaba la tabla, reubicado por diagonal, así que la memoria compartida no cambia.
+- **`IK2_PROJ_SPLIT=1`.** La proyección fusionada q|k|v|r|gate|sink se escribía en un [T][N] F32 (563 MB por visita con T = 4096) y después se repartía. Ahora cada parte va con su propio GEMM directo a su búfer.
+
+| Prellenado 16K, chunk 4096, `IK2_PF_NVFP4=1` (×3, alternado) | tok/s | Δ |
+|---|---:|---:|
+| base | 3571 [3342–3578] | — |
+| `IK2_FA_BIAS=1` | 3691 [3680–3696] | +3,4 % |
+| `IK2_PROJ_SPLIT=1` | 3756 [3754–3773] | +5,2 % |
+| **los dos** | **3886 [3872–3889]** | **+8,8 %** |
+
+**Corrección:**
+- **`tests/ik2_kernels_test.cu`, atención flash con el sesgo hecho en el kernel:** se compara contra la referencia en double en los 5 casos (ventanas, anillo, splits, consultas vacías) y queda en el mismo margen que con la tabla. Contra la tabla, la coincidencia es la de FP16: P se redondea a FP16 para P·V.
+- **Control de paridad con todo prendido:** pasa en los tres modos. `dump` da top-1 98,0 % y KL 3,0e-3; `decode` 97,6 % y 3,2e-3; `block` 97,9 % y 3,4e-3.

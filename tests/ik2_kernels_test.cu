@@ -1506,7 +1506,17 @@ void test_attn_flash() {
         auto qf = fvec((size_t) c.Tq * q_ld, 4.0f);
         std::vector<uint16_t> q16(qf.size());
         for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
-        auto bias = fvec((size_t) c.Tq * H * c.extent, 2.0f), sink = fvec((size_t) c.Tq * H, 3.0f);
+        // the bias as the model makes it: a query's 16 relative states . rel_proj [extent][16] (the table in F32 as
+        // cuBLAS writes it; the fused kernel takes rq and rel_proj and must give the same attention)
+        auto rq = fvec((size_t) c.Tq * H * 16, 1.5f), proj = fvec((size_t) c.extent * 16, 0.5f);
+        std::vector<float> bias((size_t) c.Tq * H * c.extent);
+        for (size_t qh = 0; qh < (size_t) c.Tq * H; ++qh)
+            for (int d = 0; d < c.extent; ++d) {
+                double a = 0;
+                for (int j = 0; j < 16; ++j) a += (double) rq[qh * 16 + j] * proj[(size_t) d * 16 + j];
+                bias[qh * c.extent + d] = (float) a;
+            }
+        auto sink = fvec((size_t) c.Tq * H, 3.0f);
         const float scale = 1.0f / std::sqrt((float) D);
         const int o_ld = H * D + 32;
         uint16_t *dq = dev(q16), *dk = dev(kc), *dv = dev(vc);
@@ -1516,6 +1526,11 @@ void test_attn_flash() {
         k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, db, c.extent, c.window, ds, dout,
                           o_ld, dscr, scr, c.n_split, 0);
         const auto out = host(dout, (size_t) c.Tq * o_ld);
+        float *drq = dev(rq), *dpj = dev(proj), *dout2 = dev_n<float>((size_t) c.Tq * o_ld);
+        k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, nullptr, c.extent, c.window, ds,
+                          dout2, o_ld, dscr, scr, c.n_split, 0, nullptr, drq, dpj);
+        const auto out2 = host(dout2, (size_t) c.Tq * o_ld);
+        std::vector<float> got2;
         std::vector<float> got;
         std::vector<double> want;
         for (int i = 0; i < c.Tq; ++i) {
@@ -1542,12 +1557,21 @@ void test_attn_flash() {
                         o += std::exp(l[kp - lo] - m) / sum * h2f_host(vc[((size_t) (c.kv_cap > 0 ? kp % c.kv_cap : kp) * KV + g) * D + d]);
                     want.push_back(o);
                     got.push_back(out[(size_t) i * o_ld + h * D + d]);
+                    got2.push_back(out2[(size_t) i * o_ld + h * D + d]);
                 }
             }
         }
         expect(c.name, got, want, 1e-2, 2e-3);
+        char nm[96];
+        std::snprintf(nm, sizeof nm, "%s, bias made in the kernel", c.name);
+        expect(nm, got2, want, 1e-2, 2e-3);
+        // and against the table's run: the bias the same to F32 rounding - which can still round P (FP16 for P V)
+        // the other way, so the outputs agree to FP16's precision, not F32's
+        std::vector<double> got_d(got.begin(), got.end());
+        std::snprintf(nm, sizeof nm, "%s, made = table", c.name);
+        expect(nm, got2, got_d, 2e-3, 2e-5);
         for (uint16_t* p : {dq, dk, dv}) cudaFree(p);
-        for (float* p : {db, ds, dout, dscr}) cudaFree(p);
+        for (float* p : {db, ds, dout, dscr, drq, dpj, dout2}) cudaFree(p);
     }
 }
 

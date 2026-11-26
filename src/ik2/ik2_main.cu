@@ -395,6 +395,8 @@ bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts gro
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
 struct Prof {
     double attn = 0, route = 0, upload = 0, experts = 0, rest = 0;
+    double core = 0;   // (in attn's place: the attention itself - the relative bias and the attention kernels)
+    double pre = 0, proj = 0, prep = 0, post = 0;   // (in attn's place too: run_layer_attn's other parts)
     double t = 0;
     void start() {
         if (g_prof) cudaStreamSynchronize(g_s), t = now();
@@ -1568,10 +1570,28 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         in_q = W.xq, in_k = W.xk, in_v = W.xv;
         xk16 = W.xk16, xv16 = W.xv16;
     }
+    g_pf.lap(g_pf.pre);
     const int HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     float *q_p = W.q, *k_p = W.kk, *v_p = W.vv, *r_p = W.rr, *gate_p = W.gate, *sink_p = W.sink;
     float *kd_p = W.dyn, *vd_p = W.dyn;
-    if (Ly.sliding) {
+    // IK2_PROJ_SPLIT=1 (a prompt: T > 1): each part of a fused projection by its own rows of the matrix straight into
+    // its buffer (q, k, v, r, gate, sink) - no [T][N] F32 product written and copied apart again
+    static const bool proj_split = getenv("IK2_PROJ_SPLIT") && atoi(getenv("IK2_PROJ_SPLIT"));
+    const bool split = proj_split && T > 1;
+    if (Ly.sliding && Ly.wqkvrg.N > 0 && split) {
+        const int N = Ly.wqkvrg.N, rest = N - HD - 2 * KD - HR - HD;   // (rest: the sink's rows, c.H, or none)
+        matmul_rows(Ly.wqkvrg, 0, HD, in_q, W.x16, T, W.q, HD);
+        matmul_rows(Ly.wqkvrg, HD, KD, in_k, msg ? xk16 : W.x16, T, W.kk, KD);
+        matmul_rows(Ly.wqkvrg, HD + KD, KD, in_v, msg ? xv16 : W.x16, T, W.vv, KD);
+        matmul_rows(Ly.wqkvrg, HD + 2 * KD, HR, in_q, W.x16, T, W.rr, HR);
+        matmul_rows(Ly.wqkvrg, HD + 2 * KD + HR, HD, in_q, W.x16, T, W.gate, HD);
+        if (rest == c.H) matmul_rows(Ly.wqkvrg, N - c.H, c.H, in_q, W.x16, T, W.sink, c.H);
+        else gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+        conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
+        conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
+        k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
+        k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
+    } else if (Ly.sliding) {
         if (Ly.wqkvrg.N > 0) {
             if (msg) {   // the fused rows by the input they take: q | k | v | r, gate (and the sink)
                 const int N = Ly.wqkvrg.N;
@@ -1611,7 +1631,14 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
         k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
     } else {
-        if (Ly.wqrg.N > 0) {
+        if (Ly.wqrg.N > 0 && split) {
+            const int N = Ly.wqrg.N;
+            matmul_rows(Ly.wqrg, 0, HD, in_q, W.x16, T, W.q, HD);
+            matmul_rows(Ly.wqrg, HD, HR, in_q, W.x16, T, W.rr, HR);
+            matmul_rows(Ly.wqrg, HD + HR, HD, in_q, W.x16, T, W.gate, HD);
+            if (N - 2 * HD - HR == c.H) matmul_rows(Ly.wqrg, N - c.H, c.H, in_q, W.x16, T, W.sink, c.H);
+            else gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+        } else if (Ly.wqrg.N > 0) {
             matmul(Ly.wqrg, in_q, W.x16, T, W.qkv, Ly.wqrg.N);
             const bool has_sink = !g_dense_q8;
             if (T == 1) {
@@ -1635,21 +1662,29 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         if (!g_dense_q8) {
             const int off_k = T == 1 ? Ly.wqrg.N : 0;
             const int off_v = T == 1 ? Ly.wqrg.N + Ly.wk_dyn.N : 0;
+            if (split) {
+                matmul_rows(Ly.wk_dyn, 0, KD, in_k, xk16, T, W.kk, KD);
+                matmul_rows(Ly.wk_dyn, KD, Ly.wk_dyn.N - KD, in_k, xk16, T, W.dyn, Ly.wk_dyn.N - KD);
+            } else
             matmul(Ly.wk_dyn, in_k, xk16, T, W.qkv + off_k, Ly.wk_dyn.N);
             if (T == 1) {
                 k_p = W.qkv + off_k;
                 kd_p = k_p + KD;
-            } else {
+            } else if (!split) {
                 unpack_segments(W.qkv + off_k, T, {{W.kk, KD}, {W.dyn, c.KV * 4}}, g_s);
             }
             conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
             k::conv4(k_p, Ly.h_k, Ly.sc_k, kd_p, c.KV, T, KD, W.kconv, g_s);
 
+            if (split) {
+                matmul_rows(Ly.wv_dyn, 0, KD, in_v, xv16, T, W.vv, KD);
+                matmul_rows(Ly.wv_dyn, KD, Ly.wv_dyn.N - KD, in_v, xv16, T, W.dyn, Ly.wv_dyn.N - KD);
+            } else
             matmul(Ly.wv_dyn, in_v, xv16, T, W.qkv + off_v, Ly.wv_dyn.N);
             if (T == 1) {
                 v_p = W.qkv + off_v;
                 vd_p = v_p + KD;
-            } else {
+            } else if (!split) {
                 unpack_segments(W.qkv + off_v, T, {{W.vv, KD}, {W.dyn, c.KV * 4}}, g_s);
             }
             conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
@@ -1676,6 +1711,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.kc8 : (void*)Ly.kc, bytes, Ly.dev, g_s));
         CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.vc8 : (void*)Ly.vc, bytes, Ly.dev, g_s));
     }
+    g_pf.lap(g_pf.proj);
     if (g_kv_fp8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
@@ -1686,6 +1722,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                           Ly.kv_cap, g_s, Ly.page_table);
     }
 
+    g_pf.lap(g_pf.prep);
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
     const int window = Ly.sliding ? c.window : (1 << 30);
     const int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
@@ -1731,23 +1768,30 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         };
         if ((g_flash || Ly.page_table) && c.D == 128 && W.relb && extent <= W.relb_ext) {
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
+            // IK2_FA_BIAS=1: the relative bias made inside the flash kernel from r and rel_proj (no [Tq * H][extent]
+            // table written and read again a chunk of queries)
+            static const bool fa_bias = getenv("IK2_FA_BIAS") && atoi(getenv("IK2_FA_BIAS"));
+            const bool fused_bias = fa_bias && c.d_rel == 16 && (g_kv_fp8 || !k::fa_wgmma());
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
                 const int Tq = std::min(Work::kRelbRows, T - ts);
                 const float one_f = 1.0f, zero_f = 0.0f;
-                CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, Tq * c.H, c.d_rel, &one_f, Ly.rel_proj,
-                                CUDA_R_32F, c.d_rel, r_p + (size_t) ts * HR, CUDA_R_32F, c.d_rel, &zero_f, W.relb,
-                                CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+                if (!fused_bias)
+                    CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, Tq * c.H, c.d_rel, &one_f, Ly.rel_proj,
+                                    CUDA_R_32F, c.d_rel, r_p + (size_t) ts * HR, CUDA_R_32F, c.d_rel, &zero_f, W.relb,
+                                    CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+                const float* rq = fused_bias ? r_p + (size_t) ts * HR : nullptr;
+                const float* relp = fused_bias ? Ly.rel_proj : nullptr;
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
                 if (g_kv_fp8)
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
                                       sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s,
-                                      Ly.page_table);
+                                      Ly.page_table, rq, relp);
                 else
                     k::attn_flash_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
-                                      W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s, Ly.page_table);
+                                      W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s, Ly.page_table, rq, relp);
             }
         } else
         for (int ts = 0; ts < T;) {
@@ -1829,6 +1873,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             ts += Tq;
         }
     }
+    g_pf.lap(g_pf.core);
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
@@ -1838,6 +1883,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     } else {
         k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
     }
+    g_pf.lap(g_pf.post);
 }
 
 // A layer-major prefill pass of many tokens uses nearly every expert of a layer, so the ones not in VRAM can be
@@ -7266,6 +7312,16 @@ int main(int argc, char** argv) {
         logits.clear();
     }
     if (gen) place_decode(M, (int)prompt.size());
+    if (g_prof)   // (IK2_PROF=1: every phase synchronised - slower, but each one's GPU time)
+        std::printf("prompt profile: attention %.2f s - the loop's banks, residuals and norms in %.2f s, q k v r gate products and convs "
+                    "%.2f s, q k v prepared and cached %.2f s, the attention kernels %.2f s, the output's product and "
+                    "conv %.2f s, the MoE's residual and norm %.2f s; router %.2f s, uploads %.2f "
+                    "s, experts %.2f s, rest %.2f s\n",
+                    g_pf.attn + g_pf.core + g_pf.pre + g_pf.proj + g_pf.prep + g_pf.post, g_pf.pre, g_pf.proj,
+                    g_pf.prep, g_pf.core, g_pf.post, g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
+    if (g_prof)
+        std::printf("attention: %d heads, %d kv heads of %d, relative states %d, extent %d (sliding %d), window %d\n",
+                    c.H, c.KV, c.D, c.d_rel, c.extent, c.extent_swa, c.window);
     // greedy generation
     g_pf = Prof{};
     std::vector<int> out;

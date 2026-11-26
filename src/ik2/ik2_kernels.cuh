@@ -89,16 +89,22 @@ void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int
 /// kc / vc the cache [pos or pos % kv_cap][KV * D]; keys [max(0, qp - window + 1), qp] of each query; the relative
 /// bias from the table bias [Tq * H][extent] (as attn_probs_bias_f16), sink [Tq][H] -> out [Tq] rows of o_ld (F32).
 /// The keys split n_split ways (scratch: n_split * Tq * H * (D + 2) floats; fewer splits if it holds fewer).
+/// rq given (not on the Hopper kernel): no table - the bias made in the kernel from the queries' 16 relative states
+/// rq [Tq][H][16] and relp, rel_proj [extent][16] (on the tensor cores, split FP16: the F32 product to ~2^-22).
 void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window,
                     const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
-                    cudaStream_t s, const int* page_table = nullptr);
+                    cudaStream_t s, const int* page_table = nullptr, const float* rq = nullptr,
+                    const float* relp = nullptr);
 /// attn_flash_f16 over an FP8 (E4M3) cache: its tiles turned into FP16 as they are loaded; qk_scale with K's scale
 /// folded in, the output times v_inv_scale (as attn_decode_fp8).
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
-                    int n_split, cudaStream_t s, const int* page_table = nullptr);
+                    int n_split, cudaStream_t s, const int* page_table = nullptr, const float* rq = nullptr,
+                    const float* relp = nullptr);
+/// the Hopper kernel (wgmma) is the one attn_flash_f16 runs here (it does not make the bias itself)
+bool fa_wgmma();
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 

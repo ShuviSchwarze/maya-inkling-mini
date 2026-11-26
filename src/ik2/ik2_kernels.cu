@@ -1108,7 +1108,8 @@ __global__ void __launch_bounds__(NW * 32, 2)        //  made FP16 in shared mem
 attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __restrict__ kc,
                       const KVT* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
                       const float* __restrict__ bias, int extent, int window, int n_split, float* __restrict__ o_part,
-                      float2* __restrict__ ml_part, const int* __restrict__ page_table = nullptr) {
+                      float2* __restrict__ ml_part, const int* __restrict__ page_table = nullptr,
+                      const float* __restrict__ rq = nullptr, const float* __restrict__ relp = nullptr) {
     extern __shared__ __align__(16) uint16_t fa_sm[];
     constexpr bool F8 = sizeof(KVT) == 1;        // (FP8: one FP16 tile, and the bytes of two [2][kFaRaw] after it)
     uint16_t* Ks = fa_sm;                        // [2][kFaBN][kFaLd]
@@ -1149,6 +1150,26 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             qf[kk][3] = ib < Tq ? *(const uint32_t*) (qrb + d + 8) : 0u;
         }
     }
+    // rq given (16 relative states): the bias is made here, a near tile at a time, instead of read from a table.  The
+    // warp's 16 queries' states r [16][16] are the A fragments, split as hi + lo FP16 (hi = fp16(x), lo = fp16(x -
+    // hi)): a tile's 16 x 80 products r . rel_proj[distance] are three mma.sync (hi hi, hi lo, lo hi), F32 sums - the
+    // F32 dot product to ~2^-22, not a table of [queries x heads][extent] floats written and read again
+    uint32_t rh[4] = {0u, 0u, 0u, 0u}, rl[4] = {0u, 0u, 0u, 0u};
+    if (rq) {
+#pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            const int i = (f & 1) ? ib : ia, k = tq * 2 + (f >> 1) * 8;
+            float x0 = 0.0f, x1 = 0.0f;
+            if (i < Tq) {
+                const float2 v = *(const float2*) (rq + ((size_t) i * H + h) * 16 + k);
+                x0 = v.x, x1 = v.y;
+            }
+            const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
+            const __half l0 = __float2half_rn(x0 - __half2float(h0)), l1 = __float2half_rn(x1 - __half2float(h1));
+            __half2 hh = __halves2half2(h0, h1), ll = __halves2half2(l0, l1);
+            rh[f] = *reinterpret_cast<uint32_t*>(&hh), rl[f] = *reinterpret_cast<uint32_t*>(&ll);
+        }
+    }
     float o[kFaD / 8][4];
 #pragma unroll
     for (int j = 0; j < kFaD / 8; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
@@ -1169,7 +1190,34 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
         const bool any = !(kt > qpos0 + wi + 15 || kt + kFaBN - 1 < qpos0 + wi - window + 1) && wi < Tq;
         const bool near = qpos0 + wi - (kt + kFaBN - 1) < extent;
         // cp.async groups in flight here: K/V(t), then this tile's bias, then K/V(t+1) (empty groups keep the count)
-        if (any && near) {
+        if (any && near && rq) {
+            // M [16 rows][80] = r . rel_proj[dmin + m] (dmin: row 0's distance to the tile's last key); the bias of
+            // (row, key c) is M[row][63 + row - c], written to Bw[row][c].  Distances outside [0, extent): 0
+            const int dmin = qpos0 + wi - kt - (kFaBN - 1);
+#pragma unroll
+            for (int nb = 0; nb < 10; ++nb) {
+                const int dist = dmin + nb * 8 + gr;
+                float2 p0 = make_float2(0.0f, 0.0f), p1 = p0;
+                if (dist >= 0 && dist < extent) {
+                    p0 = *(const float2*) (relp + (size_t) dist * 16 + tq * 2);
+                    p1 = *(const float2*) (relp + (size_t) dist * 16 + tq * 2 + 8);
+                }
+                const __half a0 = __float2half_rn(p0.x), a1 = __float2half_rn(p0.y);
+                const __half c0 = __float2half_rn(p1.x), c1 = __float2half_rn(p1.y);
+                __half2 bh0 = __halves2half2(a0, a1), bh1 = __halves2half2(c0, c1);
+                __half2 bl0 = __halves2half2(__float2half_rn(p0.x - __half2float(a0)), __float2half_rn(p0.y - __half2float(a1)));
+                __half2 bl1 = __halves2half2(__float2half_rn(p1.x - __half2float(c0)), __float2half_rn(p1.y - __half2float(c1)));
+                float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma16816(acc, rl, *reinterpret_cast<uint32_t*>(&bh0), *reinterpret_cast<uint32_t*>(&bh1));
+                mma16816(acc, rh, *reinterpret_cast<uint32_t*>(&bl0), *reinterpret_cast<uint32_t*>(&bl1));
+                mma16816(acc, rh, *reinterpret_cast<uint32_t*>(&bh0), *reinterpret_cast<uint32_t*>(&bh1));
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int row = gr + (e >> 1) * 8, m = nb * 8 + tq * 2 + (e & 1), c = (kFaBN - 1) + row - m;
+                    if (c >= 0 && c < kFaBN) Bw[row * kFaBld + c] = acc[e];
+                }
+            }
+        } else if (any && near) {
 #pragma unroll 4
             for (int rr = 0; rr < 16; ++rr) {
                 const int i = wi + rr, qp = qpos0 + i;
@@ -5808,7 +5856,8 @@ bool fa_wgmma() {
 template <int NW, bool WG, class KVT>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
-                       float* o_part, float2* ml_part, cudaStream_t s, const int* page_table = nullptr) {
+                       float* o_part, float2* ml_part, cudaStream_t s, const int* page_table = nullptr,
+                       const float* rq = nullptr, const float* relp = nullptr) {
     static bool attr[16] = {};   // (per device: the attribute is a device's, and the layer split runs on several)
     int dev = 0;
     cudaGetDevice(&dev);
@@ -5820,13 +5869,13 @@ void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* 
     const dim3 grid((unsigned) ((Tq + 16 * NW - 1) / (16 * NW)), (unsigned) H, (unsigned) n_split);
     attn_flash_f16_kernel<NW, WG, KVT><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
                                                                      qk_scale, bias, extent, window, n_split, o_part,
-                                                                     ml_part, page_table);
+                                                                     ml_part, page_table, rq, relp);
     check("attn_flash");
 }
 void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window,
                     const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
-                    cudaStream_t s, const int* page_table) {
+                    cudaStream_t s, const int* page_table, const float* rq, const float* relp) {
     if (Tq <= 0) return;
     if (D != kFaD) {
         std::fprintf(stderr, "ik2::k::attn_flash_f16: D = %d, not 128\n", D);
@@ -5841,7 +5890,7 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
                                                  window, n_split, o_part, ml_part, s, page_table);
     else
         attn_flash_launch<kFaNW, false, uint16_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
-                                                  window, n_split, o_part, ml_part, s, page_table);
+                                                  window, n_split, o_part, ml_part, s, page_table, rq, relp);
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
                                                                                  out, o_ld, 1.0f);
     check("attn_flash_combine");
@@ -5849,7 +5898,7 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
-                    int n_split, cudaStream_t s, const int* page_table) {
+                    int n_split, cudaStream_t s, const int* page_table, const float* rq, const float* relp) {
     if (Tq <= 0) return;
     if (D != kFaD) {
         std::fprintf(stderr, "ik2::k::attn_flash_fp8: D = %d, not 128\n", D);
@@ -5860,7 +5909,7 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
     float* o_part = scratch;
     float2* ml_part = (float2*) (scratch + (size_t) n_split * Tq * H * kFaD);
     attn_flash_launch<kFaNW, false, uint8_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window,
-                                             n_split, o_part, ml_part, s, page_table);
+                                             n_split, o_part, ml_part, s, page_table, rq, relp);
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
                                                                                  out, o_ld, v_inv_scale);
     check("attn_flash_combine");
