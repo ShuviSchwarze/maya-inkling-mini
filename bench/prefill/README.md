@@ -103,3 +103,24 @@ Dos arreglos:
 **Corrección:**
 - **`tests/ik2_kernels_test.cu`, atención flash con el sesgo hecho en el kernel:** se compara contra la referencia en double en los 5 casos (ventanas, anillo, splits, consultas vacías) y queda en el mismo margen que con la tabla. Contra la tabla, la coincidencia es la de FP16: P se redondea a FP16 para P·V.
 - **Control de paridad con todo prendido:** pasa en los tres modos. `dump` da top-1 98,0 % y KL 3,0e-3; `decode` 97,6 % y 3,2e-3; `block` 97,9 % y 3,4e-3.
+
+## La atención global a contexto largo (2026-11-26)
+
+Prompt de 114 688 tokens con la config del servidor (FP8, chunk 4096, `IK2_PF_NVFP4`, `IK2_FA_BIAS`, `IK2_PROJ_SPLIT`), `IK2_PROF=1`: 43,5 s en total. **17,0 s son los kernels de atención** (39 %), 15,6 s los experts, 2,8 s los productos y 3,0 s los residuales.
+
+`tests/ik2_flash_bench.cu` mide el kernel solo: 24 cabezas, 8 de K/V, D = 128, las últimas 512 queries contra nk keys, sesgo hecho en el kernel. Las cifras son TFLOPS de los tensor cores (QK^T y PV, causal):
+
+| nk | FP8 | FP16 |
+|---:|---:|---:|
+| 8 192 | 46 | 59 |
+| 32 768 | 50 | 66 |
+| 65 536 | 50–53 | 67 |
+| 131 072 | 51 | 66–70 |
+
+**Con FP16 el kernel está cerca del pico práctico de la 3090. Con FP8 rinde ~25 % menos**, porque sm_86 no convierte FP8 a FP16 por hardware: cada tile se convierte por software en memoria compartida, en una pasada aparte con su propia sincronización.
+
+Lo que se probó:
+- **Un bloque por las 3 cabezas de una cabeza de K/V (GQA 24:8):** 6 warps, cada tile cargado y convertido una vez para 3 cabezas. Fue **más lento**, −5 a −20 % en FP8 y FP16: el kernel no está limitado por cargar ni convertir tiles, sino por los MMA y el softmax por warp. Descartado; no está en el código.
+- **`IK2_FA_FAST=1` (`ex2.approx` y la escala dentro del FMA):** FP8 +1–4 %, FP16 nada. Pasa el test de la atención flash, contra la referencia en double y contra la tabla. Queda opcional.
+
+Para acelerar FP8 en la 3090 haría falta rediseñar cómo el kernel convierte los tiles, por ejemplo convertir en registros directamente a los fragmentos, sin pasar por memoria compartida. La ganancia es incierta. La otra palanca es la caché: FP16 es ~30 % más rápida en la atención larga y más fiel según el control de paridad, pero a igual VRAM entra menos contexto (104K con drafter en lugar de 128K).

@@ -105,6 +105,8 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
                     const float* relp = nullptr);
 /// the Hopper kernel (wgmma) is the one attn_flash_f16 runs here (it does not make the bias itself)
 bool fa_wgmma();
+/// the mma.sync flash kernel's softmax with ex2.approx and the scale in its FMA (IK2_FA_FAST=1 sets it at the start)
+void attn_flash_fast(int on);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 

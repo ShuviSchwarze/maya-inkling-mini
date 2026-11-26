@@ -1103,8 +1103,20 @@ __device__ __forceinline__ void fa_load_tile_wg(uint16_t* Ks, uint16_t* Vs, cons
     }
 }
 
-template <int NW, bool WG, class KVT = uint16_t>   // (KVT: the cache's values, FP16 or FP8 - an FP8 tile's bytes are
-__global__ void __launch_bounds__(NW * 32, 2)        //  made FP16 in shared memory; the warpgroup path is FP16's)
+// FX (IK2_FA_FAST=1): the softmax's exponentials as ex2.approx (one MUFU; its 2^-22 is below the FP16 that P is
+// rounded to for P V) and a tile inside every row's keys scaled inside that exponential's FMA, not a multiply a logit
+__device__ __forceinline__ float ex2_approx(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+template <bool FX>
+__device__ __forceinline__ float fa_exp2(float x) {
+    if constexpr (FX) return ex2_approx(x);
+    else return exp2f(x);
+}
+template <int NW, bool WG, class KVT = uint16_t, bool FX = false>   // (KVT: the cache's values, FP16 or FP8 - an FP8
+__global__ void __launch_bounds__(NW * 32, 2)   //  tile's bytes are made FP16 in shared memory; the warpgroup path is FP16's)
 attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __restrict__ kc,
                       const KVT* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
                       const float* __restrict__ bias, int extent, int window, int n_split, float* __restrict__ o_part,
@@ -1289,7 +1301,15 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             const bool full = !near && kt + kFaBN - 1 <= qpos0 + wi && kt >= qpos0 + wi + 15 - window + 1 &&
                               wi + 15 < Tq;
             float mxa = -INFINITY, mxb = -INFINITY;
-            if (full) {
+            float ps = 1.0f;   // (FX, a full tile: the logits' scale, applied in the exponential's FMA)
+            if (full && FX) {
+#pragma unroll
+                for (int j = 0; j < kFaBN / 8; ++j) {
+                    mxa = fmaxf(mxa, fmaxf(s[j][0], s[j][1]));
+                    mxb = fmaxf(mxb, fmaxf(s[j][2], s[j][3]));
+                }
+                mxa *= sc, mxb *= sc, ps = sc;
+            } else if (full) {
 #pragma unroll
                 for (int j = 0; j < kFaBN / 8; ++j) {
                     s[j][0] *= sc, s[j][1] *= sc, s[j][2] *= sc, s[j][3] *= sc;
@@ -1319,8 +1339,8 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 1));
             mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 2));
             const float mna = fmaxf(ma, mxa), mnb = fmaxf(mb, mxb);
-            const float ca = mna == -INFINITY ? 1.0f : exp2f(ma - mna);   // (ma = -inf: exp2f(-inf) = 0)
-            const float cb = mnb == -INFINITY ? 1.0f : exp2f(mb - mnb);
+            const float ca = mna == -INFINITY ? 1.0f : fa_exp2<FX>(ma - mna);   // (ma = -inf: exp2(-inf) = 0)
+            const float cb = mnb == -INFINITY ? 1.0f : fa_exp2<FX>(mb - mnb);
             const float ua = mna == -INFINITY ? 0.0f : mna, ub = mnb == -INFINITY ? 0.0f : mnb;
             ma = mna, mb = mnb;
             la *= ca, lb *= cb;
@@ -1330,10 +1350,18 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             uint32_t pa[kFaBN / 16][4];
 #pragma unroll
             for (int kk = 0; kk < kFaBN / 16; ++kk) {
-                const float p00 = exp2f(s[2 * kk][0] - ua), p01 = exp2f(s[2 * kk][1] - ua);
-                const float p02 = exp2f(s[2 * kk][2] - ub), p03 = exp2f(s[2 * kk][3] - ub);
-                const float p10 = exp2f(s[2 * kk + 1][0] - ua), p11 = exp2f(s[2 * kk + 1][1] - ua);
-                const float p12 = exp2f(s[2 * kk + 1][2] - ub), p13 = exp2f(s[2 * kk + 1][3] - ub);
+                float p00, p01, p02, p03, p10, p11, p12, p13;
+                if constexpr (FX) {
+                    p00 = ex2_approx(fmaf(s[2 * kk][0], ps, -ua)), p01 = ex2_approx(fmaf(s[2 * kk][1], ps, -ua));
+                    p02 = ex2_approx(fmaf(s[2 * kk][2], ps, -ub)), p03 = ex2_approx(fmaf(s[2 * kk][3], ps, -ub));
+                    p10 = ex2_approx(fmaf(s[2 * kk + 1][0], ps, -ua)), p11 = ex2_approx(fmaf(s[2 * kk + 1][1], ps, -ua));
+                    p12 = ex2_approx(fmaf(s[2 * kk + 1][2], ps, -ub)), p13 = ex2_approx(fmaf(s[2 * kk + 1][3], ps, -ub));
+                } else {
+                    p00 = exp2f(s[2 * kk][0] - ua), p01 = exp2f(s[2 * kk][1] - ua);
+                    p02 = exp2f(s[2 * kk][2] - ub), p03 = exp2f(s[2 * kk][3] - ub);
+                    p10 = exp2f(s[2 * kk + 1][0] - ua), p11 = exp2f(s[2 * kk + 1][1] - ua);
+                    p12 = exp2f(s[2 * kk + 1][2] - ub), p13 = exp2f(s[2 * kk + 1][3] - ub);
+                }
                 la += p00 + p01 + p10 + p11;
                 lb += p02 + p03 + p12 + p13;
                 pa[kk][0] = f2_to_u32(p00, p01);
@@ -5842,6 +5870,13 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
                                                                                    qk_scale, bias, extent, window, sink);
     check("attn_probs_bias_f16");
 }
+// IK2_FA_FAST=1 (or attn_flash_fast): the mma.sync kernel's softmax with ex2.approx and the scale in its FMA
+static int g_fa_fast = -1;
+void attn_flash_fast(int on) { g_fa_fast = on; }
+static bool fa_fast() {
+    if (g_fa_fast < 0) g_fa_fast = getenv("IK2_FA_FAST") && atoi(getenv("IK2_FA_FAST")) ? 1 : 0;
+    return g_fa_fast != 0;
+}
 // the Hopper kernel (wgmma) on a 9.x GPU of a build with sm_90a; IK2_WGMMA=0: the mma.sync one everywhere
 bool fa_wgmma() {
     static const int on = [] {
@@ -5853,7 +5888,7 @@ bool fa_wgmma() {
     }();
     return on != 0;
 }
-template <int NW, bool WG, class KVT>
+template <int NW, bool WG, class KVT, bool FX = false>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
                        float* o_part, float2* ml_part, cudaStream_t s, const int* page_table = nullptr,
@@ -5862,12 +5897,12 @@ void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* 
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 16 && !attr[dev]) {
-        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmem);
+        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT, FX>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmem);
         check("attn_flash (shared memory)");
         attr[dev] = true;
     }
     const dim3 grid((unsigned) ((Tq + 16 * NW - 1) / (16 * NW)), (unsigned) H, (unsigned) n_split);
-    attn_flash_f16_kernel<NW, WG, KVT><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
+    attn_flash_f16_kernel<NW, WG, KVT, FX><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
                                                                      qk_scale, bias, extent, window, n_split, o_part,
                                                                      ml_part, page_table, rq, relp);
     check("attn_flash");
@@ -5888,6 +5923,9 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
     if (fa_wgmma())
         attn_flash_launch<kFaNW, true, uint16_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
                                                  window, n_split, o_part, ml_part, s, page_table);
+    else if (fa_fast())
+        attn_flash_launch<kFaNW, false, uint16_t, true>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias,
+                                                        extent, window, n_split, o_part, ml_part, s, page_table, rq, relp);
     else
         attn_flash_launch<kFaNW, false, uint16_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
                                                   window, n_split, o_part, ml_part, s, page_table, rq, relp);
@@ -5908,8 +5946,12 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
     n_split = std::max(1, std::min<int>(n_split, (int) (scratch_floats / per_split)));
     float* o_part = scratch;
     float2* ml_part = (float2*) (scratch + (size_t) n_split * Tq * H * kFaD);
-    attn_flash_launch<kFaNW, false, uint8_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window,
-                                             n_split, o_part, ml_part, s, page_table, rq, relp);
+    if (fa_fast())
+        attn_flash_launch<kFaNW, false, uint8_t, true>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
+                                                       window, n_split, o_part, ml_part, s, page_table, rq, relp);
+    else
+        attn_flash_launch<kFaNW, false, uint8_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
+                                                 window, n_split, o_part, ml_part, s, page_table, rq, relp);
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
                                                                                  out, o_ld, v_inv_scale);
     check("attn_flash_combine");

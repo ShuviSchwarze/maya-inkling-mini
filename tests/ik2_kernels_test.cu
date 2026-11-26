@@ -1477,7 +1477,20 @@ void test_attn_decode_mma() {
 
 // attn_flash_f16 (the fused prefill attention) against a double reference: linear and ring caches, a window, the
 // relative bias table, the sink, a chunk from 0 and one at an offset, 1 to 7 key splits (some of them empty).
+void test_attn_flash_run(bool fast);
 void test_attn_flash() {
+    // the default kernel; then IK2_FA_FAST's on the same data (the random generator put back: the tests after
+    // these see the data they always did)
+    const std::mt19937 at = rng;
+    test_attn_flash_run(false);
+    const std::mt19937 after = rng;
+    rng = at;
+    k::attn_flash_fast(1);
+    test_attn_flash_run(true);
+    k::attn_flash_fast(0);
+    rng = after;
+}
+void test_attn_flash_run(bool fast) {
     const int H = 12, KV = 2, D = 128;
     struct Case {
         int Tq, qpos0, window, extent, kv_cap, n_split;
@@ -1561,14 +1574,15 @@ void test_attn_flash() {
                 }
             }
         }
-        expect(c.name, got, want, 1e-2, 2e-3);
         char nm[96];
-        std::snprintf(nm, sizeof nm, "%s, bias made in the kernel", c.name);
+        std::snprintf(nm, sizeof nm, "%s%s", fast ? "fast " : "", c.name);
+        expect(nm, got, want, 1e-2, 2e-3);
+        std::snprintf(nm, sizeof nm, "%s%s, bias made in the kernel", fast ? "fast " : "", c.name);
         expect(nm, got2, want, 1e-2, 2e-3);
         // and against the table's run: the bias the same to F32 rounding - which can still round P (FP16 for P V)
         // the other way, so the outputs agree to FP16's precision, not F32's
         std::vector<double> got_d(got.begin(), got.end());
-        std::snprintf(nm, sizeof nm, "%s, made = table", c.name);
+        std::snprintf(nm, sizeof nm, "%s%s, made = table", fast ? "fast " : "", c.name);
         expect(nm, got2, got_d, 2e-3, 2e-5);
         for (uint16_t* p : {dq, dk, dv}) cudaFree(p);
         for (float* p : {db, ds, dout, dscr, drq, dpj, dout2}) cudaFree(p);
