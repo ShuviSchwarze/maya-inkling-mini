@@ -6818,6 +6818,7 @@ int main(int argc, char** argv) {
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
+            const size_t L_raw = L, hist_raw = hist.size();
             if (park_on && (hist.size() >= (size_t) kParkLeast || !parks.empty())) {
                 int live = 0;   // what the state held gives this request (as below: L, or a snapshot at or before it)
                 if (L == hist.size() && (L < ids.size() || !last.empty())) live = (int) L;
@@ -6863,6 +6864,11 @@ int main(int argc, char** argv) {
                 }
             }
             const int cached = (int) L;
+            if (ids.size() >= 1024) {
+                std::fprintf(stderr, "ik2 cache: prompt=%zu hist=%zu match=%zu reused=%d\n",
+                             ids.size(), hist_raw, L_raw, cached);
+                std::fflush(stderr);
+            }
             const double t0 = now();
             const uint64_t miss0 = dev_cache(0).misses, bytes0 = dev_cache(0).bytes_up;
             for (auto& v : g_cnt_hist) v = 0;
@@ -6886,6 +6892,12 @@ int main(int argc, char** argv) {
                         forward_prefill_sup(M, ids.data() + p0, n, (int) p0, sub_chunk,
                                             last_c ? OutMode::kLogits : OutMode::kNone, lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
+                        if (!last_c && ids.size() - (p0 + n) <= 7 * (size_t) T_pass) {
+                            Snap& sn = snaps[snap_next];
+                            snap_next = (snap_next + 1) % (int) snaps.size();
+                            sn.pos = (int) (p0 + n);
+                            snap_copy(sn, true);
+                        }
                         if (serve_maya) {   // (read, total, ms, tok/s, reused)
                             const double ms = (now() - t0) * 1e3;
                             std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,
@@ -6909,6 +6921,12 @@ int main(int argc, char** argv) {
                         if (drafter) {   // (the drafter's context for these positions, from their taps)
                             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                        }
+                        if (!last_c && ids.size() - (p0 + n) <= 7 * (size_t) chunk) {
+                            Snap& sn = snaps[snap_next];
+                            snap_next = (snap_next + 1) % (int) snaps.size();
+                            sn.pos = (int) (p0 + n);
+                            snap_copy(sn, true);
                         }
                         if (serve_maya && ids.size() - L > (size_t)chunk) {
                             const double ms = (now() - t0) * 1e3;
